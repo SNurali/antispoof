@@ -9,10 +9,12 @@ from typing import Optional
 
 from pydantic import BaseModel
 
+import ipaddress
+
 import cv2
 import numpy as np
 import torch
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -32,6 +34,21 @@ engine: Optional[LivenessEngine] = None
 gpu_name: str = "N/A"
 
 app = FastAPI(title="Anti-Spoofing Liveness Service", version="0.1.0")
+
+# IP allowlist — only local network + localhost
+ALLOWED_NETWORKS = [
+    ipaddress.ip_network("127.0.0.0/8"),      # localhost
+    ipaddress.ip_network("192.168.0.0/24"),    # local LAN
+]
+
+
+@app.middleware("http")
+async def ip_filter(request: Request, call_next):
+    client_ip = ipaddress.ip_address(request.client.host if request.client else "0.0.0.0")
+    if not any(client_ip in net for net in ALLOWED_NETWORKS):
+        return JSONResponse(status_code=403, content={"detail": "Access denied"})
+    return await call_next(request)
+
 
 # Serve the test UI
 STATIC_DIR = Path(__file__).resolve().parent / "static"

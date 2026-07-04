@@ -6,7 +6,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/var/lib/mysql/logs/yoyo/antispoof
-ExecStart=/var/lib/mysql/logs/yoyo/antispoof/.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8090
+ExecStart=/var/lib/mysql/logs/yoyo/antispoof/.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8090
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
