@@ -1,0 +1,73 @@
+#!/bin/bash
+# Anti-Spoofing Liveness Service — control script
+# Usage: spoof {start|stop|status|restart}
+#
+# Install: ln -sf $(pwd)/ctl.sh /usr/local/bin/spoof
+
+set -e
+
+# Resolve real script location (follows symlinks)
+SCRIPT_PATH="$(readlink -f "$0")"
+PROJECT_DIR="$(dirname "$SCRIPT_PATH")"
+PIDFILE="$PROJECT_DIR/.pid"
+LOGFILE="$PROJECT_DIR/server.log"
+
+cd "$PROJECT_DIR"
+
+_spoof_start() {
+    if [ -f "$PIDFILE" ] && kill -0 $(cat "$PIDFILE") 2>/dev/null; then
+        echo "SPOOF already running (PID $(cat $PIDFILE))"
+        return 1
+    fi
+
+    if [ -f .venv/bin/activate ]; then
+        source .venv/bin/activate
+    fi
+
+    nohup uvicorn app.main:app --host 127.0.0.1 --port 8090 >> "$LOGFILE" 2>&1 &
+    echo $! > "$PIDFILE"
+    sleep 2
+
+    if kill -0 $(cat "$PIDFILE") 2>/dev/null; then
+        echo "SPOOF STARTED — PID $(cat $PIDFILE) — http://127.0.0.1:8090/spoof-server"
+    else
+        echo "SPOOF FAILED TO START — check $LOGFILE"
+        cat "$LOGFILE" | tail -5
+        rm -f "$PIDFILE"
+        return 1
+    fi
+}
+
+_spoof_stop() {
+    if [ -f "$PIDFILE" ] && kill -0 $(cat "$PIDFILE") 2>/dev/null; then
+        local pid=$(cat "$PIDFILE")
+        kill "$pid"
+        sleep 1
+        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+        rm -f "$PIDFILE"
+        echo "SPOOF STOPPED — PID $pid"
+    else
+        echo "SPOOF not running"
+    fi
+}
+
+_spoof_status() {
+    if [ -f "$PIDFILE" ] && kill -0 $(cat "$PIDFILE") 2>/dev/null; then
+        local pid=$(cat "$PIDFILE")
+        echo "SPOOF RUNNING — PID $pid — http://127.0.0.1:8090"
+        curl -s http://127.0.0.1:8090/health 2>/dev/null || echo "  (health check failed)"
+    else
+        echo "SPOOF STOPPED"
+    fi
+}
+
+case "${1:-}" in
+    start)   _spoof_start ;;
+    stop)    _spoof_stop ;;
+    status)  _spoof_status ;;
+    restart) _spoof_stop; sleep 1; _spoof_start ;;
+    *)
+        echo "Usage: spoof {start|stop|status|restart}"
+        exit 1
+        ;;
+esac

@@ -29,3 +29,4 @@ ENV/
 *.swp
 .idea/
 .vscode/
+.pid

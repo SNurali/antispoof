@@ -1,10 +1,13 @@
 """FastAPI application — face liveness anti-spoofing service."""
 
+import base64
 import io
 import time
 import logging
 from pathlib import Path
 from typing import Optional
+
+from pydantic import BaseModel
 
 import cv2
 import numpy as np
@@ -185,3 +188,29 @@ async def verify_batch(images: list[UploadFile] = File(...)) -> dict:
 
     total_ms = round((time.perf_counter() - t0) * 1000, 1)
     return {"results": results, "total_ms": total_ms, "count": len(results)}
+
+
+# ---------------------------------------------------------------------------
+# POST /spoof-server  —  формат для интеграции с внешним сервером
+# ---------------------------------------------------------------------------
+class SpoofRequest(BaseModel):
+    photo: str  # base64-encoded image
+
+
+@app.post("/spoof-server")
+async def spoof_server(req: SpoofRequest) -> dict:
+    """Проверка liveness по base64. Формат совместим с внешним сервером."""
+    t0 = time.perf_counter()
+
+    try:
+        img_bytes = base64.b64decode(req.photo)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64")
+
+    img = _read_image(img_bytes)
+    result = _run_single(img)
+
+    elapsed = round(time.perf_counter() - t0, 3)
+    is_spoof = 0 if result["is_real"] else 1
+
+    return {"elapsed_time": elapsed, "is_spoof": is_spoof}
