@@ -1,0 +1,11 @@
+version: "3.8"
+
+services:
+  antispoof:
+    build: .
+    ports:
+      - "8090:8090"
+    environment:
+      - DEVICE=auto
+      - LIVENESS_THRESHOLD=0.5
+    restart: unless-stopped

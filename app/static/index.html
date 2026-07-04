@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Anti-Spoofing Liveness Test</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0a0a0a;
+            color: #e0e0e0;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+        }
+        h1 {
+            font-size: 28px;
+            margin-bottom: 8px;
+            color: #fff;
+        }
+        .subtitle {
+            color: #888;
+            margin-bottom: 24px;
+            font-size: 14px;
+        }
+        .container {
+            display: flex;
+            gap: 24px;
+            flex-wrap: wrap;
+            justify-content: center;
+            max-width: 1000px;
+            width: 100%;
+        }
+        .panel {
+            background: #1a1a1a;
+            border-radius: 16px;
+            padding: 20px;
+            border: 1px solid #2a2a2a;
+            flex: 1;
+            min-width: 320px;
+        }
+        .panel h2 {
+            font-size: 16px;
+            color: #aaa;
+            margin-bottom: 12px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        #videoContainer {
+            position: relative;
+            width: 100%;
+            aspect-ratio: 4/3;
+            background: #000;
+            border-radius: 12px;
+            overflow: hidden;
+            margin-bottom: 16px;
+        }
+        #video {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            transform: scaleX(-1);
+        }
+        #canvas {
+            display: none;
+        }
+        .overlay {
+            position: absolute;
+            top: 12px;
+            left: 12px;
+            background: rgba(0,0,0,0.7);
+            padding: 6px 12px;
+            border-radius: 8px;
+            font-size: 12px;
+            color: #0f0;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .overlay .dot {
+            width: 8px; height: 8px;
+            background: #0f0;
+            border-radius: 50%;
+            animation: pulse 1.5s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+        .btn {
+            width: 100%;
+            padding: 14px;
+            border: none;
+            border-radius: 12px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .btn-primary {
+            background: #2563eb;
+            color: #fff;
+        }
+        .btn-primary:hover { background: #1d4ed8; }
+        .btn-primary:disabled {
+            background: #333;
+            color: #666;
+            cursor: not-allowed;
+        }
+        .btn-danger {
+            background: #dc2626;
+            color: #fff;
+            margin-top: 8px;
+        }
+        .btn-danger:hover { background: #b91c1c; }
+        .capture-flash {
+            position: absolute;
+            inset: 0;
+            background: #fff;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.1s;
+        }
+        .capture-flash.active { opacity: 0.8; }
+        #result {
+            margin-top: 16px;
+        }
+        .verdict {
+            text-align: center;
+            padding: 20px;
+            border-radius: 12px;
+            font-size: 24px;
+            font-weight: 700;
+            margin-bottom: 12px;
+        }
+        .verdict.real {
+            background: rgba(34, 197, 94, 0.15);
+            color: #22c55e;
+            border: 2px solid #22c55e;
+        }
+        .verdict.spoof {
+            background: rgba(239, 68, 68, 0.15);
+            color: #ef4444;
+            border: 2px solid #ef4444;
+        }
+        .verdict.no_face {
+            background: rgba(234, 179, 8, 0.15);
+            color: #eab308;
+            border: 2px solid #eab308;
+        }
+        .details {
+            background: #111;
+            border-radius: 8px;
+            padding: 12px;
+            font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
+            font-size: 12px;
+            line-height: 1.6;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        .details .key { color: #60a5fa; }
+        .details .val { color: #f0f0f0; }
+        .details .good { color: #22c55e; }
+        .details .bad { color: #ef4444; }
+        .details .warn { color: #eab308; }
+        .screenshot-preview {
+            margin-top: 12px;
+            text-align: center;
+        }
+        .screenshot-preview img {
+            max-width: 100%;
+            border-radius: 8px;
+            border: 1px solid #333;
+            transform: scaleX(-1);
+        }
+        .history { margin-top: 16px; }
+        .history-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 12px;
+            background: #111;
+            border-radius: 8px;
+            margin-bottom: 6px;
+            font-size: 13px;
+        }
+        .history-item .icon { font-size: 18px; }
+        .history-item .time { color: #666; margin-left: auto; font-size: 11px; }
+        .history-item .ms { color: #888; font-size: 11px; }
+        .status-bar {
+            display: flex;
+            gap: 16px;
+            margin-bottom: 16px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+        .status-item {
+            background: #1a1a1a;
+            border: 1px solid #2a2a2a;
+            padding: 8px 16px;
+            border-radius: 8px;
+            font-size: 13px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .status-item .label { color: #888; }
+        .status-item .value { color: #fff; font-weight: 600; }
+        .loading { opacity: 0.5; pointer-events: none; }
+    </style>
+</head>
+<body>
+    <h1>Anti-Spoofing Liveness Test</h1>
+    <p class="subtitle">Сфотографируй реальное лицо или поднеси фото/экран — сервис определишь живой ты или спуфер</p>
+
+    <div class="status-bar" id="statusBar">
+        <div class="status-item">
+            <span class="label">Сервер:</span>
+            <span class="value" id="serverStatus">проверяю...</span>
+        </div>
+        <div class="status-item">
+            <span class="label">GPU:</span>
+            <span class="value" id="gpuInfo">—</span>
+        </div>
+        <div class="status-item">
+            <span class="label">Модели:</span>
+            <span class="value" id="modelsInfo">—</span>
+        </div>
+    </div>
+
+    <div class="container">
+        <div class="panel">
+            <h2>Камера</h2>
+            <div id="videoContainer">
+                <video id="video" autoplay playsinline></video>
+                <canvas id="canvas"></canvas>
+                <div class="capture-flash" id="flash"></div>
+                <div class="overlay">
+                    <div class="dot" id="camDot"></div>
+                    <span id="camStatus">камера отключена</span>
+                </div>
+            </div>
+            <button class="btn btn-primary" id="startBtn" onclick="startCamera()">Включить камеру</button>
+            <button class="btn btn-primary" id="captureBtn" onclick="capture()" disabled>Сфотографировать и проверить</button>
+            <button class="btn btn-danger" id="uploadBtn" onclick="document.getElementById('fileInput').click()">Загрузить фото с диска</button>
+            <input type="file" id="fileInput" accept="image/*" style="display:none" onchange="uploadFile(this)">
+            <div class="screenshot-preview" id="preview"></div>
+        </div>
+
+        <div class="panel">
+            <h2>Результат</h2>
+            <div id="result">
+                <div class="verdict no_face" id="verdict">
+                    Нажми «Сфотографировать» или загрузи фото
+                </div>
+                <div class="details" id="details" style="display:none"></div>
+            </div>
+            <div class="history" id="history"></div>
+        </div>
+    </div>
+
+    <script>
+        const API = window.location.origin;
+        let stream = null;
+        let checking = false;
+
+        async function checkHealth() {
+            try {
+                const r = await fetch(`${API}/health`);
+                const d = await r.json();
+                document.getElementById('serverStatus').textContent = 'OK';
+                document.getElementById('serverStatus').style.color = '#22c55e';
+                document.getElementById('gpuInfo').textContent = d.gpu || 'N/A';
+                document.getElementById('modelsInfo').textContent = d.models_loaded ? 'загружены' : 'нет';
+                document.getElementById('modelsInfo').style.color = d.models_loaded ? '#22c55e' : '#ef4444';
+            } catch (e) {
+                document.getElementById('serverStatus').textContent = 'НЕДОСТУПЕН';
+                document.getElementById('serverStatus').style.color = '#ef4444';
+            }
+        }
+
+        async function startCamera() {
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                alert(
+                    'Камера недоступна.\n\n' +
+                    'Причина: браузер блокирует камеру на небезопасных страницах (HTTP).\n\n' +
+                    'Решение: открой страницу по HTTPS:\n' +
+                    'https://localhost:8090\n\n' +
+                    '(прими предупреждение о сертификате — это нормально для теста)'
+                );
+                return;
+            }
+            try {
+                stream = await navigator.mediaDevices.getUserMedia({
+                    video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' }
+                });
+                document.getElementById('video').srcObject = stream;
+                document.getElementById('startBtn').textContent = 'Камера включена';
+                document.getElementById('startBtn').disabled = true;
+                document.getElementById('captureBtn').disabled = false;
+                document.getElementById('camStatus').textContent = 'камера активна';
+                document.getElementById('camDot').style.background = '#0f0';
+            } catch (e) {
+                alert('Не удалось включить камеру: ' + e.message);
+            }
+        }
+
+        async function capture() {
+            if (checking) return;
+            const video = document.getElementById('video');
+            const canvas = document.getElementById('canvas');
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(video, 0, 0);
+
+            // Flash effect
+            const flash = document.getElementById('flash');
+            flash.classList.add('active');
+            setTimeout(() => flash.classList.remove('active'), 200);
+
+            // Show preview
+            document.getElementById('preview').innerHTML =
+                `<img src="${canvas.toDataURL('image/jpeg', 0.95)}" alt="capture">`;
+
+            // Convert canvas to blob via Promise
+            const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.95));
+            if (blob) {
+                await verifyBlob(blob);
+            }
+        }
+
+        async function uploadFile(input) {
+            if (checking || !input.files.length) return;
+            const file = input.files[0];
+            document.getElementById('preview').innerHTML =
+                `<img src="${URL.createObjectURL(file)}" alt="upload">`;
+            await verifyBlob(file);
+            input.value = '';
+        }
+
+        async function verifyBlob(blob) {
+            checking = true;
+            const btn = document.getElementById('captureBtn');
+            btn.textContent = 'Проверяю...';
+            btn.disabled = true;
+
+            const verdict = document.getElementById('verdict');
+            verdict.className = 'verdict no_face';
+            verdict.textContent = 'Анализирую...';
+
+            const details = document.getElementById('details');
+            details.style.display = 'none';
+
+            try {
+                const form = new FormData();
+                form.append('image', blob, 'capture.jpg');
+                const t0 = performance.now();
+                const r = await fetch(`${API}/verify`, { method: 'POST', body: form });
+                const d = await r.json();
+                const elapsed = Math.round(performance.now() - t0);
+
+                // Verdict
+                if (d.label === 'no_face') {
+                    verdict.className = 'verdict no_face';
+                    verdict.textContent = 'Лицо не обнаружено';
+                } else if (d.is_real) {
+                    verdict.className = 'verdict real';
+                    verdict.textContent = 'REAL — живое лицо';
+                } else {
+                    verdict.className = 'verdict spoof';
+                    verdict.textContent = 'SPOOF — подделка!';
+                }
+
+                // Details
+                details.style.display = 'block';
+                const nnLabel = d.signals?.nn_label || d.label;
+                const nnScore = d.signals?.nn_score || d.score;
+                const spoofProb = d.signals?.spoof_probability || 0;
+                const triggered = d.signals?.signals_triggered || [];
+
+                let html = '';
+                html += row('Вердикт', d.is_real ? 'REAL' : d.label.toUpperCase(), d.is_real ? 'good' : 'bad');
+                html += row('score', d.score.toFixed(4), d.score >= d.threshold ? 'good' : 'bad');
+                html += row('threshold', d.threshold.toFixed(2), 'val');
+                html += row('processing_ms', elapsed + ' ms', 'val');
+                html += '<br>';
+                html += row('Нейросеть', nnLabel, nnLabel === 'real' ? 'good' : 'bad');
+                html += row('NN score', nnScore.toFixed(4), 'val');
+                html += row('Spoof probability', spoofProb.toFixed(4), spoofProb > 0.3 ? 'bad' : 'good');
+                if (triggered.length) {
+                    html += row('Сигналы', triggered.join(', '), 'warn');
+                }
+                if (d.signals?.signal_scores) {
+                    html += '<br>';
+                    for (const [k, v] of Object.entries(d.signals.signal_scores)) {
+                        if (v > 0) {
+                            html += row(`  ${k}`, v.toFixed(4), v > 0.3 ? 'bad' : 'val');
+                        }
+                    }
+                }
+                details.innerHTML = html;
+
+                // History
+                addHistory(d, elapsed);
+
+            } catch (e) {
+                verdict.className = 'verdict no_face';
+                verdict.textContent = 'Ошибка: ' + e.message;
+            }
+
+            checking = false;
+            btn.textContent = 'Сфотографировать и проверить';
+            btn.disabled = false;
+        }
+
+        function row(key, val, cls) {
+            return `<span class="key">${key}:</span> <span class="${cls}">${val}</span><br>`;
+        }
+
+        function addHistory(d, ms) {
+            const h = document.getElementById('history');
+            const now = new Date().toLocaleTimeString('ru-RU');
+            const icon = d.is_real ? '🟢' : d.label === 'no_face' ? '🟡' : '🔴';
+            const label = d.is_real ? 'REAL' : d.label === 'no_face' ? 'NO FACE' : 'SPOOF';
+            const div = document.createElement('div');
+            div.className = 'history-item';
+            div.innerHTML = `
+                <span class="icon">${icon}</span>
+                <span>${label}</span>
+                <span class="ms">score: ${d.score.toFixed(2)}</span>
+                <span class="ms">${ms}ms</span>
+                <span class="time">${now}</span>
+            `;
+            h.insertBefore(div, h.firstChild);
+            if (h.children.length > 20) h.removeChild(h.lastChild);
+        }
+
+        // Auto-check health on load
+        checkHealth();
+        setInterval(checkHealth, 10000);
+    </script>
+</body>
+</html>
