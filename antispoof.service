@@ -1,0 +1,15 @@
+[Unit]
+Description=Antispoof Face Liveness Detection Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/var/lib/mysql/logs/yoyo/antispoof
+ExecStart=/var/lib/mysql/logs/yoyo/antispoof/.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8090
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
