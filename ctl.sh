@@ -20,6 +20,13 @@ _spoof_start() {
         return 1
     fi
 
+    # Clean stale PID file
+    rm -f "$PIDFILE" 2>/dev/null
+
+    # Kill zombie on port if any
+    fuser -k 8090/tcp &>/dev/null || true
+    sleep 1
+
     if [ -f .venv/bin/activate ]; then
         source .venv/bin/activate
     fi
@@ -39,14 +46,28 @@ _spoof_start() {
 }
 
 _spoof_stop() {
+    local stopped=0
+
+    # Try PID file first
     if [ -f "$PIDFILE" ] && kill -0 $(cat "$PIDFILE") 2>/dev/null; then
         local pid=$(cat "$PIDFILE")
         kill "$pid"
         sleep 1
         kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
-        rm -f "$PIDFILE"
         echo "SPOOF STOPPED — PID $pid"
-    else
+        stopped=1
+    fi
+
+    # Fallback: kill anything on port 8090
+    if fuser 8090/tcp &>/dev/null; then
+        fuser -k 8090/tcp &>/dev/null || true
+        echo "SPOOF STOPPED — killed process on port 8090"
+        stopped=1
+    fi
+
+    rm -f "$PIDFILE"
+
+    if [ "$stopped" -eq 0 ]; then
         echo "SPOOF not running"
     fi
 }
