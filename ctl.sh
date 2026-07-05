@@ -33,13 +33,13 @@ _spoof_start() {
 
     nohup uvicorn app.main:app --host 0.0.0.0 --port 8090 >> "$LOGFILE" 2>&1 &
     echo $! > "$PIDFILE"
-    sleep 2
+    sleep 3
 
     if kill -0 $(cat "$PIDFILE") 2>/dev/null; then
-        echo "SPOOF STARTED — PID $(cat $PIDFILE) — http://127.0.0.1:8090/spoof-server"
+        echo "SPOOF STARTED — PID $(cat $PIDFILE) — http://0.0.0.0:8090/spoof-server"
     else
         echo "SPOOF FAILED TO START — check $LOGFILE"
-        cat "$LOGFILE" | tail -5
+        tail -5 "$LOGFILE"
         rm -f "$PIDFILE"
         return 1
     fi
@@ -86,7 +86,15 @@ case "${1:-}" in
     start)   _spoof_start ;;
     stop)    _spoof_stop ;;
     status)  _spoof_status ;;
-    restart) _spoof_stop; sleep 1; _spoof_start ;;
+    restart)
+        set +e
+        _spoof_stop
+        sleep 2
+        # Ensure port is free
+        fuser -k 8090/tcp &>/dev/null
+        sleep 1
+        _spoof_start
+        ;;
     *)
         echo "Usage: spoof {start|stop|status|restart}"
         exit 1
