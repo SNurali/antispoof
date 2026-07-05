@@ -31,7 +31,7 @@ _spoof_start() {
         source .venv/bin/activate
     fi
 
-    nohup uvicorn app.main:app --host 127.0.0.1 --port 8090 >> "$LOGFILE" 2>&1 &
+    nohup uvicorn app.main:app --host 0.0.0.0 --port 8090 >> "$LOGFILE" 2>&1 &
     echo $! > "$PIDFILE"
     sleep 2
 
