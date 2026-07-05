@@ -76,7 +76,14 @@ _spoof_status() {
     if [ -f "$PIDFILE" ] && kill -0 $(cat "$PIDFILE") 2>/dev/null; then
         local pid=$(cat "$PIDFILE")
         echo "SPOOF RUNNING — PID $pid — http://127.0.0.1:8090"
-        curl -s http://127.0.0.1:8090/health 2>/dev/null || echo "  (health check failed)"
+        local ok=0
+    for i in 1 2 3 4 5; do
+        if curl -s --max-time 3 http://127.0.0.1:8090/health 2>/dev/null; then
+            ok=1; break
+        fi
+        sleep 2
+    done
+    [ "$ok" -eq 0 ] && echo "  (health check failed)"
     else
         echo "SPOOF STOPPED"
     fi
