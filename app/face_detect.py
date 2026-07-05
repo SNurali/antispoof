@@ -16,9 +16,9 @@ class FaceDetector:
     # confidence gate and get rejected as no_face. 320 recovers those without
     # meaningfully raising cost, and never changes returned bbox coordinates
     # (they are scaled from the original width/height).
-    DET_SIZE = 320
+    DET_SIZE = 480
 
-    def __init__(self, model_dir: Path, confidence: float = 0.6) -> None:
+    def __init__(self, model_dir: Path, confidence: float = 0.4) -> None:
         deploy = model_dir / "detection_model" / "deploy.prototxt"
         weights = model_dir / "detection_model" / "Widerface-RetinaFace.caffemodel"
         self._net = cv2.dnn.readNetFromCaffe(str(deploy), str(weights))

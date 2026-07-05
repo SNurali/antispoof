@@ -18,7 +18,7 @@ from app.multisignal import analyze_face, SIGNAL_WEIGHTS, RECAPTURE_SPOOF_THRESH
 # never pushed the CNN past ~0.85 real-confidence, while a live (even low-res)
 # webcam face scores ~0.99. Gating the recapture override on this stops
 # false-rejecting real low-res captures without letting file-based fakes pass.
-NN_TRUST_REAL = 0.95
+NN_TRUST_REAL = 0.90
 
 
 def _fuse(nn_label: int, nn_score: float, signal_info: dict) -> tuple[str, float]:

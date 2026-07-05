@@ -357,10 +357,10 @@ def recapture_spoof_score(face_native_bgr: np.ndarray, face_px: Optional[int]) -
     dist = np.sqrt((yy - 112) ** 2 + (xx - 112) ** 2)
     hf = float(spec[dist > 60].sum() / (spec.sum() + 1e-9))  # high-freq ratio
 
-    s_lap = _ramp(lap, 1500.0, 2600.0)
-    s_teng = _ramp(teng, 45.0, 68.0)
-    s_resid = _ramp(resid, 6.0, 10.0)
-    s_hf = _ramp(hf, 0.30, 0.42)
+    s_lap = _ramp(lap, 800.0, 2600.0)
+    s_teng = _ramp(teng, 25.0, 68.0)
+    s_resid = _ramp(resid, 3.0, 10.0)
+    s_hf = _ramp(hf, 0.15, 0.42)
 
     detail = 0.45 * s_lap + 0.20 * s_teng + 0.20 * s_resid + 0.15 * s_hf
 
