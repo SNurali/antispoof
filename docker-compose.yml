@@ -8,4 +8,13 @@ services:
     environment:
       - DEVICE=auto
       - LIVENESS_THRESHOLD=0.5
+      - SERVICE_TOKEN=${SERVICE_TOKEN:?Set SERVICE_TOKEN in .env}
+      - RATE_LIMIT_BURST=20
+      - RATE_LIMIT_SUSTAINED=5.0
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8090/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     restart: unless-stopped

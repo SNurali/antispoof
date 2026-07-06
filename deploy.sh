@@ -9,6 +9,7 @@
 #
 # Env overrides (all optional, sane CPU-prod defaults):
 #   PORT=8090 HOST=0.0.0.0 DEVICE=cpu MODE=https LIVENESS_THRESHOLD=0.5 MAX_BATCH=16
+#   SERVICE_TOKEN=<secret> RATE_LIMIT_BURST=20 RATE_LIMIT_SUSTAINED=5.0
 #
 set -euo pipefail
 
@@ -21,6 +22,9 @@ export PORT="${PORT:-8090}"
 export DEVICE="${DEVICE:-cpu}"                 # prod is CPU-only
 export LIVENESS_THRESHOLD="${LIVENESS_THRESHOLD:-0.5}"
 export MAX_BATCH="${MAX_BATCH:-16}"
+export SERVICE_TOKEN="${SERVICE_TOKEN:-}"        # shared-secret with Laravel; empty = dev mode (no auth)
+export RATE_LIMIT_BURST="${RATE_LIMIT_BURST:-20}"
+export RATE_LIMIT_SUSTAINED="${RATE_LIMIT_SUSTAINED:-5.0}"
 MODE="${MODE:-https}"                          # https (dashboard/camera) | http
 
 VENV_DIR="${SCRIPT_DIR}/.venv"
@@ -115,6 +119,9 @@ Environment=HOST=${HOST}
 Environment=PORT=${PORT}
 Environment=LIVENESS_THRESHOLD=${LIVENESS_THRESHOLD}
 Environment=MAX_BATCH=${MAX_BATCH}
+Environment=SERVICE_TOKEN=${SERVICE_TOKEN}
+Environment=RATE_LIMIT_BURST=${RATE_LIMIT_BURST}
+Environment=RATE_LIMIT_SUSTAINED=${RATE_LIMIT_SUSTAINED}
 ExecStart=${VENV_DIR}/bin/python ${UVICORN_ARGS[@]}
 Restart=on-failure
 RestartSec=3
