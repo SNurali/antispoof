@@ -20,6 +20,19 @@ from app.multisignal import analyze_face, SIGNAL_WEIGHTS, RECAPTURE_SPOOF_THRESH
 # false-rejecting real low-res captures without letting file-based fakes pass.
 NN_TRUST_REAL = 0.90
 
+# Below this NN spoof-confidence, the raw CNN call is treated as "weak, not a
+# confirmed detection" and can be overridden back to real by the independent
+# multi-signal analysis (mirrors NN_TRUST_REAL, the symmetric case: the NN can
+# be wrong in the *false-reject* direction too, not just false-accept).
+NN_TRUST_SPOOF = 0.90
+
+# Max multi-signal `spoof_probability` allowed when overriding a weak NN
+# "spoof" call back to "real". Calibrated on incident_urgut (n=11 spoof,
+# spoof_probability range 0.297-0.578) vs the 2026-07-06 11:36 false-reject
+# (bald outdoor selfie against a wood-grain door, spoof_probability=0.157):
+# 0.20 sits in the ~0.14 gap between them with margin on both sides.
+SIGNAL_TRUST_REAL_MAX = 0.20
+
 
 def _fuse(nn_label: int, nn_score: float, signal_info: dict) -> tuple[str, float]:
     """Combine NN output with multi-signal analysis into a final verdict.
@@ -61,6 +74,21 @@ def _fuse(nn_label: int, nn_score: float, signal_info: dict) -> tuple[str, float
     if recap >= RECAPTURE_SPOOF_THRESHOLD and recapture_confirmed and not nn_very_confident_real:
         return "spoof", max(recap, spoof_prob)
     if nn_label != 1:
+        # 2026-07-06 incident fix #2: a real outdoor selfie (bright sun, bald
+        # head, high-contrast wood-grain door background) made the CNN itself
+        # call "spoof" at only 0.554 confidence, while every independent
+        # texture/color/moire/sharpness signal read 0.0 and recapture (0.315)
+        # stayed below the recapture-override threshold — spoof_probability
+        # 0.157 was BELOW every genuine urgut spoof (min 0.297). The old logic
+        # trusted any NN "spoof" label unconditionally, with no path back to
+        # "real" even when every independent signal disagreed. Require the
+        # NN to not be highly confident (<0.90, symmetric with NN_TRUST_REAL)
+        # AND no recapture/texture confirmation AND spoof_probability clearly
+        # in the real range before overriding a weak/wrong NN spoof call.
+        nn_weak_spoof = nn_score < NN_TRUST_SPOOF
+        signals_say_real = spoof_prob < SIGNAL_TRUST_REAL_MAX and not recapture_confirmed and recap < RECAPTURE_SPOOF_THRESHOLD
+        if nn_weak_spoof and signals_say_real:
+            return "real", 1.0 - spoof_prob
         return "spoof", max(nn_score, spoof_prob)
     if spoof_prob > 0.6:
         return "spoof", spoof_prob

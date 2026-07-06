@@ -16,7 +16,6 @@ CAL = Path("/home/mrnurali/E-GAZ/docs/plans/calibration/incident_urgut")
 sets = {
     "REAL": sorted((CAL/"original").glob("*.jpg")),
     "SPOOF": sorted((CAL/"urgut").glob("*.jpg")),
-    "NEWFR": [Path("/home/mrnurali/E-GAZ/docs/photo_2026-07-06_10-40-40.jpg")],
 }
 print(f"{'SET':<7}{'file':<32}{'recap':>7}{'fft':>6}{'lbp':>6}{'color':>7}{'moire':>7}{'sharp':>7}{'jpeg':>7}{'spoof_p':>8}")
 for label, files in sets.items():

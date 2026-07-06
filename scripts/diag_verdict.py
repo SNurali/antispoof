@@ -16,7 +16,6 @@ CAL = Path("/home/mrnurali/E-GAZ/docs/plans/calibration/incident_urgut")
 sets = [
     ("REAL", sorted((CAL/"original").glob("*.jpg")), "real"),
     ("SPOOF", sorted((CAL/"urgut").glob("*.jpg")), "spoof"),
-    ("NEWFR", [Path("/home/mrnurali/E-GAZ/docs/photo_2026-07-06_10-40-40.jpg")], "real"),
 ]
 total_real=0; correct_real=0; total_spoof=0; correct_spoof=0
 for label, files, expected in sets:

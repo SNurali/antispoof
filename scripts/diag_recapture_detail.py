@@ -34,7 +34,6 @@ CAL = Path("/home/mrnurali/E-GAZ/docs/plans/calibration/incident_urgut")
 sets = {
     "REAL": sorted((CAL/"original").glob("*.jpg")),
     "SPOOF": sorted((CAL/"urgut").glob("*.jpg")),
-    "NEWFR": [Path("/home/mrnurali/E-GAZ/docs/photo_2026-07-06_10-40-40.jpg")],
 }
 
 hdr = f"{'SET':<7}{'file':<32}{'lap':>8}{'teng':>7}{'resid':>7}{'hf':>7}{'s_lap':>7}{'s_teng':>7}{'s_res':>7}{'s_hf':>7}{'fpx':>9}{'s_fpx':>7}{'final':>7}"

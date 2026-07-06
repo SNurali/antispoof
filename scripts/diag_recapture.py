@@ -19,7 +19,6 @@ CAL = Path("/home/mrnurali/E-GAZ/docs/plans/calibration/incident_urgut")
 sets = {
     "REAL(original)": sorted((CAL / "original").glob("*.jpg")),
     "SPOOF(urgut)": sorted((CAL / "urgut").glob("*.jpg")),
-    "NEW_FR_PHOTO": [Path("/home/mrnurali/E-GAZ/docs/photo_2026-07-06_10-40-40.jpg")],
 }
 
 rows = []
