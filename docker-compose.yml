@@ -4,7 +4,9 @@ services:
   antispoof:
     build: .
     ports:
-      - "8090:8090"
+      # Loopback-only publish — 0.0.0.0 bypasses host ufw/firewall rules.
+      # If Laravel runs on another host, use a private VPC IP instead of 0.0.0.0.
+      - "127.0.0.1:8090:8090"
     environment:
       - DEVICE=auto
       - LIVENESS_THRESHOLD=0.5

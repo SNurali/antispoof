@@ -8,7 +8,7 @@
 #   MODE=http ./deploy.sh          # plain HTTP instead of HTTPS (no camera dashboard needed)
 #
 # Env overrides (all optional, sane CPU-prod defaults):
-#   PORT=8090 HOST=0.0.0.0 DEVICE=cpu MODE=https LIVENESS_THRESHOLD=0.5 MAX_BATCH=16
+#   PORT=8090 HOST=127.0.0.1 DEVICE=cpu MODE=https LIVENESS_THRESHOLD=0.5 MAX_BATCH=16
 #   SERVICE_TOKEN=<secret> RATE_LIMIT_BURST=20 RATE_LIMIT_SUSTAINED=5.0
 #
 set -euo pipefail
@@ -17,7 +17,9 @@ cd "$(dirname "$0")"
 SCRIPT_DIR="$(pwd)"
 
 # ---------- config (env overridable) ----------
-export HOST="${HOST:-0.0.0.0}"
+# Loopback-only by default (0.0.0.0 bypasses ufw/firewall rules). Override HOST to a
+# private VPC IP only if Laravel calls this service from a different host on a closed network.
+export HOST="${HOST:-127.0.0.1}"
 export PORT="${PORT:-8090}"
 export DEVICE="${DEVICE:-cpu}"                 # prod is CPU-only
 export LIVENESS_THRESHOLD="${LIVENESS_THRESHOLD:-0.5}"
@@ -97,6 +99,8 @@ health_check() {
 MODE_FLAG="${1:-}"
 
 if [ "$MODE_FLAG" = "--install-service" ]; then
+    : "${SERVICE_TOKEN:?SERVICE_TOKEN is required for a persistent/production deploy (systemd service). Set SERVICE_TOKEN=<secret>, e.g. \$(openssl rand -hex 32).}"
+
     log "Installing systemd --user service (antispoof.service)"
     SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
     mkdir -p "$SYSTEMD_USER_DIR"

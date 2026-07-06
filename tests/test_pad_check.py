@@ -1,7 +1,10 @@
 """Tests for POST /pad/check endpoint and related hardening."""
 
 import base64
+import logging
 import os
+import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import cv2
@@ -102,7 +105,7 @@ def client_with_auth():
 
 class TestPadCheckHappyPath:
     def test_valid_image_returns_verdict(self, client):
-        """Valid base64 image → real/spoof verdict."""
+        """Valid base64 image → contract-shaped response per FACEID_PHASE1_PAD_GATE §1."""
         resp = client.post("/pad/check", json={
             "correlation_id": "test-001",
             "transaction_type": "sale",
@@ -111,14 +114,18 @@ class TestPadCheckHappyPath:
         })
         assert resp.status_code == 200
         data = resp.json()
-        assert data["verdict"] in ("real", "spoof", "low_quality", "no_face")
+        assert data["verdict"] in ("live", "spoof", "low_quality")
+        assert "reason" in data
         assert "score" in data
+        assert "threshold" in data
+        assert "face_detected" in data
+        assert "model_version" in data
         assert "processing_ms" in data
         assert isinstance(data["save_frame"], bool)
         assert isinstance(data["signals"], dict)
 
-    def test_verdict_real_when_confident(self, client):
-        """High-confidence real face → verdict='real'."""
+    def test_verdict_live_when_confident(self, client):
+        """High-confidence real face → verdict='live', reason=null."""
         resp = client.post("/pad/check", json={
             "correlation_id": "test-real",
             "transaction_type": "sale",
@@ -126,7 +133,10 @@ class TestPadCheckHappyPath:
             "face_photo": _make_base64_image(),
         })
         assert resp.status_code == 200
-        assert resp.json()["verdict"] == "real"
+        data = resp.json()
+        assert data["verdict"] == "live"
+        assert data["reason"] is None
+        assert data["face_detected"] is True
 
     def test_verdict_spoof_when_spoof_detected(self, client):
         """Spoof detection → verdict='spoof', save_frame=True."""
@@ -152,6 +162,7 @@ class TestPadCheckHappyPath:
         assert resp.status_code == 200
         data = resp.json()
         assert data["verdict"] == "spoof"
+        assert data["reason"] == "PASSIVE_PAD_SPOOF"
         assert data["save_frame"] is True
 
         # Restore
@@ -225,6 +236,82 @@ class TestPadCheckValidation:
         })
         assert resp.status_code == 400
 
+    def test_transaction_type_other_than_sale_returns_422(self, client):
+        """transaction_type is a closed enum — only 'sale' is confirmed in v1."""
+        resp = client.post("/pad/check", json={
+            "correlation_id": "test-txn-type",
+            "transaction_type": "receive",
+            "transaction_ref": "req:bal",
+            "face_photo": _make_base64_image(),
+        })
+        assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# POST /pad/check — service-failure paths (TIMEOUT / INTERNAL_ERROR)
+# ---------------------------------------------------------------------------
+
+class TestPadCheckErrorPaths:
+    def test_timeout_returns_low_quality_with_reason(self, client):
+        """Inference exceeding the deadline → verdict=low_quality, reason=TIMEOUT (not a security verdict)."""
+        import app.main as m
+        original_timeout = m.INFERENCE_TIMEOUT_S
+        original_predict = m.engine.predict
+        m.INFERENCE_TIMEOUT_S = 0.05
+
+        def _slow_predict(*_args, **_kwargs):
+            time.sleep(0.3)
+            return ("real", 0.95, True, {})
+
+        m.engine.predict = _slow_predict
+        try:
+            resp = client.post("/pad/check", json={
+                "correlation_id": "test-timeout",
+                "transaction_type": "sale",
+                "transaction_ref": "req:bal",
+                "face_photo": _make_base64_image(),
+            })
+        finally:
+            m.INFERENCE_TIMEOUT_S = original_timeout
+            m.engine.predict = original_predict
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["verdict"] == "low_quality"
+        assert data["reason"] == "TIMEOUT"
+
+    def test_internal_error_returns_low_quality_with_reason(self, client):
+        """Unhandled exception during inference → verdict=low_quality, reason=INTERNAL_ERROR, no traceback leak."""
+        import app.main as m
+        from app.main import app
+        from fastapi.testclient import TestClient
+
+        original_predict = m.engine.predict
+
+        def _raising_predict(*_args, **_kwargs):
+            raise RuntimeError("model exploded")
+
+        m.engine.predict = _raising_predict
+        try:
+            # raise_server_exceptions=False: Starlette's ServerErrorMiddleware re-raises
+            # the original exception for the ASGI server after invoking our handler —
+            # we want the actual 500 JSON response the client would see, not the raw traceback.
+            with TestClient(app, raise_server_exceptions=False) as c:
+                resp = c.post("/pad/check", json={
+                    "correlation_id": "test-internal-error",
+                    "transaction_type": "sale",
+                    "transaction_ref": "req:bal",
+                    "face_photo": _make_base64_image(),
+                })
+        finally:
+            m.engine.predict = original_predict
+
+        assert resp.status_code == 500
+        data = resp.json()
+        assert data["verdict"] == "low_quality"
+        assert data["reason"] == "INTERNAL_ERROR"
+        assert "model exploded" not in resp.text
+
 
 # ---------------------------------------------------------------------------
 # GET /health
@@ -271,3 +358,75 @@ class TestRateLimit:
         # Restore high limit for other tests
         m._rate_limiter._burst = 1000
         assert 429 in responses, f"Expected 429 in {responses}"
+
+    def test_sustained_limit_blocks_average_rate_even_under_burst(self):
+        """Sustained (average req/s over the window) must cap requests even when
+        burst never trips — the old `_sustained` field was dead code and would
+        have let this pass unbounded."""
+        from app.main import _RateLimiter
+
+        limiter = _RateLimiter(burst=1000, sustained=1.0)  # 1 req/s avg -> 60 allowed per 60s window
+        allowed = [limiter.allow("203.0.113.5") for _ in range(65)]
+
+        assert False in allowed, "sustained limiter should reject once the average rate is exceeded"
+        assert sum(allowed) <= 60
+
+    def test_prune_removes_stale_ip_entries(self):
+        """Stale/empty per-IP deques must be dropped eventually (memory-leak guard)."""
+        from app.main import _RateLimiter
+
+        limiter = _RateLimiter(burst=1000, sustained=1000.0)
+        limiter.allow("198.51.100.1")
+        assert "198.51.100.1" in limiter._windows
+
+        far_future_cutoff = time.monotonic() + 1000.0
+        limiter._prune_stale(far_future_cutoff)
+        assert "198.51.100.1" not in limiter._windows
+
+
+# ---------------------------------------------------------------------------
+# Regression: no frame persistence anywhere (not on disk, not in audit log)
+# ---------------------------------------------------------------------------
+
+class TestNoFrameStorage:
+    def test_pad_check_leaves_no_frame_artifact_on_disk_or_audit_log(self, client):
+        """The service must never write the raw frame to disk or leak it into the audit log."""
+        import app.main as m
+
+        service_root = Path(m.__file__).resolve().parent.parent  # antispoof/
+        excluded = {".venv", ".git", ".pytest_cache", "__pycache__", "models", "certs"}
+
+        def _snapshot() -> set:
+            files = set()
+            for p in service_root.rglob("*"):
+                if p.is_file() and not any(part in excluded for part in p.parts):
+                    files.add(str(p.relative_to(service_root)))
+            return files
+
+        before = _snapshot()
+
+        audit_records: list = []
+        capture_handler = logging.Handler()
+        capture_handler.emit = lambda record: audit_records.append(record.getMessage())
+        m.audit_log.addHandler(capture_handler)
+
+        b64_photo = _make_base64_image()
+        try:
+            resp = client.post("/pad/check", json={
+                "correlation_id": "test-no-frame-storage",
+                "transaction_type": "sale",
+                "transaction_ref": "req:bal",
+                "face_photo": b64_photo,
+            })
+        finally:
+            m.audit_log.removeHandler(capture_handler)
+
+        assert resp.status_code == 200
+
+        after = _snapshot()
+        new_files = after - before
+        assert not new_files, f"pad/check must not write new files to disk, found: {new_files}"
+
+        assert audit_records, "expected an audit log entry to be written"
+        assert all(b64_photo not in rec for rec in audit_records), "audit log must not contain the raw base64 frame"
+        assert b64_photo not in resp.text, "response must not echo back the raw frame"

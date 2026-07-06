@@ -20,7 +20,7 @@ import time
 import uuid
 from collections import deque
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -70,6 +70,12 @@ _setup_audit_handler()
 settings = Settings()
 DEVICE = resolve_device(settings.DEVICE)
 
+if not settings.SERVICE_TOKEN:
+    log.warning(
+        "SERVICE_TOKEN is empty — /pad/check auth is DISABLED (dev mode). "
+        "Do NOT run in production without a SERVICE_TOKEN set."
+    )
+
 # Globals — initialized on startup
 detector: Optional[FaceDetector] = None
 engine: Optional[LivenessEngine] = None
@@ -99,23 +105,51 @@ ALLOWED_NETWORKS = [
 # Rate limiter — sliding window, per-IP
 # ---------------------------------------------------------------------------
 class _RateLimiter:
-    """Simple sliding-window rate limiter (burst requests per second)."""
+    """Two-level sliding-window rate limiter, per-IP.
+
+    - Burst: at most `burst` requests within the last 1 second.
+    - Sustained: at most `sustained` requests/sec on AVERAGE over a
+      `SUSTAINED_WINDOW_S`-second window (e.g. 5 req/s over 60s == 300/60s).
+    Both checks share one deque of monotonic timestamps per key.
+    """
+
+    SUSTAINED_WINDOW_S = 60.0
+    _PRUNE_EVERY = 500  # opportunistically drop stale/empty per-IP deques
 
     def __init__(self, burst: int, sustained: float) -> None:
         self._burst = burst
         self._sustained = sustained
         self._windows: dict[str, deque] = {}
+        self._calls_since_prune = 0
 
     def allow(self, key: str) -> bool:
         now = time.monotonic()
         window = self._windows.setdefault(key, deque())
-        cutoff = now - 1.0
-        while window and window[0] < cutoff:
+
+        sustained_cutoff = now - self.SUSTAINED_WINDOW_S
+        while window and window[0] < sustained_cutoff:
             window.popleft()
-        if len(window) >= self._burst:
-            return False
-        window.append(now)
-        return True
+
+        burst_cutoff = now - 1.0
+        burst_count = sum(1 for t in window if t >= burst_cutoff)
+        sustained_limit = max(1, int(self._sustained * self.SUSTAINED_WINDOW_S))
+
+        allowed = burst_count < self._burst and len(window) < sustained_limit
+        if allowed:
+            window.append(now)
+
+        self._calls_since_prune += 1
+        if self._calls_since_prune >= self._PRUNE_EVERY:
+            self._prune_stale(sustained_cutoff)
+            self._calls_since_prune = 0
+
+        return allowed
+
+    def _prune_stale(self, cutoff: float) -> None:
+        """Drop per-IP deques that are empty or fully stale (memory-leak guard)."""
+        stale_keys = [k for k, w in self._windows.items() if not w or w[-1] < cutoff]
+        for k in stale_keys:
+            del self._windows[k]
 
 
 _rate_limiter = _RateLimiter(burst=settings.RATE_LIMIT_BURST, sustained=settings.RATE_LIMIT_SUSTAINED)
@@ -133,9 +167,13 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
             status_code=500,
             content={
                 "verdict": "low_quality",
+                "reason": "INTERNAL_ERROR",
                 "score": 0.0,
+                "threshold": settings.LIVENESS_THRESHOLD,
+                "face_detected": False,
                 "save_frame": False,
-                "signals": {"reason": "INTERNAL_ERROR"},
+                "signals": {},
+                "model_version": MODEL_VERSION,
                 "processing_ms": 0.0,
             },
         )
@@ -398,17 +436,26 @@ async def spoof_server(req: SpoofRequest) -> dict:
 class PadCheckRequest(BaseModel):
     """PAD-gate request from Laravel."""
     correlation_id: str = Field(..., description="UUID from Laravel for log tracing")
-    transaction_type: str = Field("sale", description="'sale' in v1, 'receive' in v2")
+    transaction_type: Literal["sale"] = Field(
+        "sale", description="Only 'sale' is confirmed in v1 (see FACEID_PHASE1_PAD_GATE §1)"
+    )
     transaction_ref: str = Field(..., description="id_request:id_ballon (natural key)")
     face_photo: str = Field(..., description="Base64 JPEG/PNG — same frame as Adliya")
 
 
 class PadCheckResponse(BaseModel):
-    """PAD-gate response."""
-    verdict: str = Field(..., description="real | spoof | low_quality | no_face")
+    """PAD-gate response — contract per FACEID_PHASE1_PAD_GATE.md §1."""
+    verdict: Literal["live", "spoof", "low_quality"] = Field(...)
+    reason: Optional[str] = Field(
+        None,
+        description="PASSIVE_PAD_SPOOF | NO_FACE | LOW_QUALITY | TIMEOUT | INTERNAL_ERROR | null",
+    )
     score: float = Field(..., description="Confidence score [0..1]")
-    save_frame: bool = Field(False, description="Laravel should encrypt+store frame")
+    threshold: float = Field(..., description="Liveness threshold used for this decision")
+    face_detected: bool = Field(..., description="Whether a face was found in the frame")
     signals: dict = Field(default_factory=dict, description="Multi-signal breakdown")
+    save_frame: bool = Field(False, description="Service already decided to persist this frame")
+    model_version: str = Field(..., description="Model/ensemble version used for this verdict")
     processing_ms: float = Field(..., description="Server-side processing time")
 
 
@@ -424,8 +471,8 @@ def _verify_service_token(x_service_token: Optional[str]) -> None:
 
 def _audit_entry(correlation_id: str, transaction_type: str, transaction_ref: str,
                  verdict: str, score: float, signals: dict, processing_ms: float,
-                 save_frame: bool, reason: str = "") -> None:
-    """Write structured JSON audit log entry."""
+                 save_frame: bool, reason: Optional[str] = None) -> None:
+    """Write structured JSON audit log entry. Metadata only — never the frame itself."""
     entry = {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "correlation_id": correlation_id,
@@ -450,9 +497,10 @@ async def pad_check(
     req: PadCheckRequest,
     x_service_token: Optional[str] = Header(None, alias="X-Service-Token"),
 ) -> PadCheckResponse:
-    """PAD-gate: classify a face frame as real/spoof/low_quality/no_face.
+    """PAD-gate: classify a face frame as live/spoof/low_quality.
 
     Called by Laravel after Adliya match (BACKEND_REQUIREMENTS_2026-07-06 п.8).
+    Contract: FACEID_PHASE1_PAD_GATE.md §1.
     """
     _verify_service_token(x_service_token)
 
@@ -468,14 +516,15 @@ async def pad_check(
     img = _read_image(img_bytes)
     _validate_image_dimensions(img)
 
-    # Models ready?
+    # Models ready? (service-side failure, not a bad frame — same family as TIMEOUT/INTERNAL_ERROR)
     if not _models_loaded or detector is None or engine is None:
         ms = round((time.perf_counter() - t0) * 1000, 1)
         _audit_entry(req.correlation_id, req.transaction_type, req.transaction_ref,
-                     "low_quality", 0.0, {}, ms, False, reason="MODELS_NOT_LOADED")
+                     "low_quality", 0.0, {}, ms, False, reason="INTERNAL_ERROR")
         return PadCheckResponse(
-            verdict="low_quality", score=0.0, save_frame=False,
-            signals={"reason": "MODELS_NOT_LOADED"}, processing_ms=ms,
+            verdict="low_quality", reason="INTERNAL_ERROR", score=0.0,
+            threshold=settings.LIVENESS_THRESHOLD, face_detected=False,
+            save_frame=False, signals={}, model_version=MODEL_VERSION, processing_ms=ms,
         )
 
     # Detect face
@@ -483,10 +532,11 @@ async def pad_check(
     if bbox is None:
         ms = round((time.perf_counter() - t0) * 1000, 1)
         _audit_entry(req.correlation_id, req.transaction_type, req.transaction_ref,
-                     "no_face", 0.0, {}, ms, False, reason="NO_FACE_DETECTED")
+                     "low_quality", 0.0, {}, ms, False, reason="NO_FACE")
         return PadCheckResponse(
-            verdict="no_face", score=0.0, save_frame=False,
-            signals={"reason": "NO_FACE_DETECTED"}, processing_ms=ms,
+            verdict="low_quality", reason="NO_FACE", score=0.0,
+            threshold=settings.LIVENESS_THRESHOLD, face_detected=False,
+            save_frame=False, signals={}, model_version=MODEL_VERSION, processing_ms=ms,
         )
 
     # Run liveness with 2-second timeout (1.4)
@@ -501,26 +551,29 @@ async def pad_check(
         _audit_entry(req.correlation_id, req.transaction_type, req.transaction_ref,
                      "low_quality", 0.0, {}, ms, False, reason="TIMEOUT")
         return PadCheckResponse(
-            verdict="low_quality", score=0.0, save_frame=False,
-            signals={"reason": "TIMEOUT"}, processing_ms=ms,
+            verdict="low_quality", reason="TIMEOUT", score=0.0,
+            threshold=settings.LIVENESS_THRESHOLD, face_detected=True,
+            save_frame=False, signals={}, model_version=MODEL_VERSION, processing_ms=ms,
         )
 
-    # Map to PAD-gate verdict
+    # Map to PAD-gate verdict (§1) — verdict/threshold logic unchanged, only naming aligned to spec
     if label == "spoof":
         verdict = "spoof"
+        reason: Optional[str] = "PASSIVE_PAD_SPOOF"
     elif score < settings.LIVENESS_THRESHOLD:
         verdict = "low_quality"
+        reason = "LOW_QUALITY"
     else:
-        verdict = "real"
+        verdict = "live"
+        reason = None
 
     save_frame = verdict in _save_frame_verdicts
     processing_ms = round((time.perf_counter() - t0) * 1000, 1)
 
-    # Audit log (every request, including "real" — for APCER/BPCER analysis)
+    # Audit log (every request, including "live" — for APCER/BPCER analysis)
     _audit_entry(
         req.correlation_id, req.transaction_type, req.transaction_ref,
-        verdict, score, signal_info, processing_ms, save_frame,
-        reason="PASSIVE_PAD_SPOOF" if verdict == "spoof" else "",
+        verdict, score, signal_info, processing_ms, save_frame, reason=reason,
     )
 
     log.info(
@@ -530,8 +583,12 @@ async def pad_check(
 
     return PadCheckResponse(
         verdict=verdict,
+        reason=reason,
         score=round(score, 4),
+        threshold=settings.LIVENESS_THRESHOLD,
+        face_detected=face_detected,
         save_frame=save_frame,
         signals=signal_info,
+        model_version=MODEL_VERSION,
         processing_ms=processing_ms,
     )
