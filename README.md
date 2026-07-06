@@ -243,7 +243,7 @@ Single-frame passive PAD cannot detect:
 ### Recommendation for Production
 
 Phase 1 is compensating control, not primary auth:
-1. **Fail-closed** if service is unavailable (`reason="TIMEOUT"|"INTERNAL_ERROR"` → reject, don't proceed)
+1. **Fail-open** if service is unavailable (`reason="TIMEOUT"|"INTERNAL_ERROR"` → proceed + log to `security_events`; owner decision 2026-07-05, Phase 1 is a compensating control — revisit at Phase 2)
 2. **Device attestation** on client (Play Integrity, App Attest) to prevent file injection
 3. **Phase 2** with challenge-response (blink/turn head) for high-risk scenarios
 

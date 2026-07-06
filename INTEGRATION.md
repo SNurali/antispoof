@@ -118,8 +118,8 @@ curl -X POST http://192.168.0.6:8090/pad/check \
 | `"PASSIVE_PAD_SPOOF"` | `spoof` | Отклонить, инцидент |
 | `"NO_FACE"` | `low_quality` | Переснять лицо |
 | `"LOW_QUALITY"` | `low_quality` | Переснять (слабое качество) |
-| `"TIMEOUT"` | `low_quality` | Сервис не ответил вовремя (fail-closed/fail-open по политике) |
-| `"INTERNAL_ERROR"` | `low_quality` | Сервис упал (fail-closed/fail-open) |
+| `"TIMEOUT"` | `low_quality` | Сервис не ответил вовремя → **fail-open**: продолжить продажу + запись `security_events` (решение владельца 2026-07-05) |
+| `"INTERNAL_ERROR"` | `low_quality` | Сервис упал → **fail-open**: продолжить продажу + запись `security_events` |
 
 **Ошибки HTTP:**
 | Код | Описание |
@@ -478,10 +478,12 @@ suspend fun verifyFaceForSale(
         }
     } catch (e: Exception) {
         Log.e("PadGate", "Service error", e)
-        false  // fail-closed
+        true  // fail-open: сбой PAD-сервиса не блокирует операцию (решение владельца 2026-07-05); запишите security_events
     }
 }
 ```
+
+> ⚠️ Пример иллюстративный. В прод-архитектуре Phase 1 antispoof вызывает **Laravel** (server-side, тот же VPC), а не мобильный клиент — сервис наружу не торчит, и `SERVICE_TOKEN` в APK класть нельзя.
 
 ### JavaScript / Node.js
 

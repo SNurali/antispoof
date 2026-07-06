@@ -134,7 +134,7 @@ curl -X POST http://localhost:8090/pad/check \
 - `verdict="live"` → `reason=null` → Laravel продолжает `/sales` как обычно
 - `verdict="spoof"` → `reason="PASSIVE_PAD_SPOOF"` → Laravel отклоняет продажу (атака обнаружена)
 - `verdict="low_quality"` → `reason="NO_FACE"|"LOW_QUALITY"` → UX-реджект "переснимите" (не безопасность, переснять)
-- `reason="TIMEOUT"|"INTERNAL_ERROR"` → Сервис недоступен; Laravel выбирает fail-open/fail-closed (рекомендуется fail-closed)
+- `reason="TIMEOUT"|"INTERNAL_ERROR"` → Сервис недоступен; политика Phase 1 — **fail-open** (решение владельца 2026-07-05): продажа продолжается, Laravel пишет `security_events` + метрику недоступности. Пересмотр на Phase 2.
 
 **Ошибки:**
 | HTTP код | Описание |
