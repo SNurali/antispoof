@@ -29,12 +29,36 @@ def _fuse(nn_label: int, nn_score: float, signal_info: dict) -> tuple[str, float
     (this is exactly the class of fake the NN misses) — UNLESS the CNN is very
     confident the face is real, which genuine fakes never achieve. Otherwise
     fall back to the NN, letting weaker signals tip borderline cases to spoof.
+
+    2026-07-06 incident fix: a real phone selfie re-compressed by a messenger
+    (960x1280, 148KB vs 180-370KB for the same resolution in the calibration
+    set) scored recapture=0.53 — inside the observed spoof range (0.43-0.93 on
+    the "urgut" incident set, n=11) purely from JPEG-recompression detail loss,
+    not an actual recapture. Raising RECAPTURE_SPOOF_THRESHOLD cannot fix this:
+    the false-positive score (0.53) sits INSIDE the spoof distribution, so any
+    threshold that excludes it also drops the weakest real spoof (0.43).
+    Instead require a second, independent confirming signal before the
+    recapture override fires. On the calibration set (n=10 real / n=11 urgut
+    spoof) `lbp` cleanly separates the classes with zero overlap: every real
+    sample (incl. the false-positive photo) scores lbp=0.0, every spoof sample
+    scores lbp>=0.30 (texture uniformity from print/screen recapture). `moire`
+    is OR'd in as a second independent confirming cue (screen pixel-grid
+    artifacts) since it did not fire on this dataset but is a plausible signal
+    for other recapture profiles (e.g. screen replay vs this print/scan-like
+    incident). Risk: on out-of-distribution recaptures where BOTH lbp and
+    moire fail to fire (e.g. a very high quality print/scan with naturally
+    varied texture), the override no longer catches them and we fall through
+    to the NN — this is a real trade-off, not eliminated, only reduced;
+    n=10/11 calibration set is a smoke test (README caveat), not a guarantee.
     """
     recap = signal_info["signal_scores"].get("recapture", 0.0)
     spoof_prob = signal_info["spoof_probability"]
+    lbp = signal_info["signal_scores"].get("lbp", 0.0)
+    moire = signal_info["signal_scores"].get("moire", 0.0)
+    recapture_confirmed = lbp > 0.1 or moire > 0.1
 
     nn_very_confident_real = nn_label == 1 and nn_score >= NN_TRUST_REAL
-    if recap >= RECAPTURE_SPOOF_THRESHOLD and not nn_very_confident_real:
+    if recap >= RECAPTURE_SPOOF_THRESHOLD and recapture_confirmed and not nn_very_confident_real:
         return "spoof", max(recap, spoof_prob)
     if nn_label != 1:
         return "spoof", max(nn_score, spoof_prob)
