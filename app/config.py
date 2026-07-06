@@ -14,6 +14,12 @@ class Settings(BaseSettings):
     DEVICE: str = "auto"
     MAX_BATCH: int = 16
 
+    # Phase 1 PAD-gate integration (BACKEND_REQUIREMENTS_2026-07-06)
+    SERVICE_TOKEN: str = ""  # X-Service-Token shared secret with Laravel; empty = auth disabled
+    RATE_LIMIT_BURST: int = 20  # max concurrent requests (per-second burst)
+    RATE_LIMIT_SUSTAINED: float = 5.0  # sustained requests per second
+    SAVE_FRAME_VERDICTS: str = "spoof"  # comma-separated verdicts that trigger save_frame=true
+
     model_config = {"env_prefix": ""}
 
 
