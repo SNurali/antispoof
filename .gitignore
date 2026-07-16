@@ -30,3 +30,9 @@ ENV/
 .idea/
 .vscode/
 .pid
+
+# --- Manual backup snapshots (main.py.bak-*) — never intended for git ---
+*.bak-*
+
+# --- Local-only manual browser test page (dev tool, not needed in prod) ---
+testpage/

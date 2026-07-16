@@ -30,11 +30,14 @@ import cv2
 import numpy as np
 import torch
 from fastapi import FastAPI, File, HTTPException, Header, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.config import Settings, resolve_device
+from app.document_check import DocumentPhotoChecker
 from app.face_detect import FaceDetector
+from app.geometry_check import GeometryCheckResult, check_face_geometry
 from app.liveness import LivenessEngine
 
 # ---------------------------------------------------------------------------
@@ -81,6 +84,15 @@ detector: Optional[FaceDetector] = None
 engine: Optional[LivenessEngine] = None
 gpu_name: str = "N/A"
 _models_loaded: bool = False
+
+# Layer 0 document-photo checker — cheap to construct (holds no model
+# weights, just HTTP config), always built regardless of DOCUMENT_CHECK_ENABLED
+# so flipping the flag at runtime doesn't require a restart.
+document_checker: DocumentPhotoChecker = DocumentPhotoChecker(
+    model=settings.DOCUMENT_CHECK_MODEL,
+    ollama_url=settings.DOCUMENT_CHECK_OLLAMA_URL,
+    timeout_s=settings.DOCUMENT_CHECK_TIMEOUT_S,
+)
 
 MODEL_VERSION = "silentface-2.7_80x80_MiniFASNetV2+4_0_0_80x80_MiniFASNetV1SE+multisignal-v1"
 
@@ -212,6 +224,21 @@ async def security_and_rate_limit(request: Request, call_next):
     return await call_next(request)
 
 
+# CORS — OFF by default (MF DOOM review, 2026-07-16: unconditional
+# allow_origins=["*"] is unnecessary attack surface — the real production
+# caller is server-side Laravel, not a browser). The middleware is only
+# attached when CORS_ALLOW_ORIGINS is non-empty, which is the case for local
+# manual browser testing via testpage/index.html (set the env var, do not
+# hardcode "*" here).
+if settings.CORS_ALLOW_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.CORS_ALLOW_ORIGINS,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+
 # Serve the test UI
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
@@ -274,8 +301,41 @@ def _validate_image_dimensions(img: np.ndarray) -> None:
         )
 
 
+def _run_geometry_gate(bbox: list[int], image_bgr: np.ndarray) -> Optional[GeometryCheckResult]:
+    """Layer 0a — shared face-to-frame geometry gate.
+
+    Reuses the bbox already computed by `FaceDetector.detect()` for this
+    request — no extra model, no network call. Shared by ALL detect
+    endpoints (/verify, /verify_batch, /spoof-server, /pad/check) so the
+    logic and calibration live in exactly one place (app/geometry_check.py).
+
+    Returns the `GeometryCheckResult` when the gate fired (caller should
+    short-circuit to its own document/spoof verdict in its native response
+    shape), or `None` when the gate is disabled, did not run (bad input —
+    should not happen with a real bbox), or did not flag the frame (caller
+    falls through to passive-PAD unchanged). Never raises.
+    """
+    if not settings.GEOMETRY_CHECK_ENABLED:
+        return None
+    geo_result = check_face_geometry(bbox, image_bgr.shape[:2], settings.FACE_RATIO_REJECT)
+    if geo_result.ran and geo_result.is_document:
+        return geo_result
+    return None
+
+
+def _geometry_signals(geo_result: GeometryCheckResult) -> dict:
+    """Build the `signals` sub-dict shape used across endpoints for a geometry-gate hit."""
+    return {
+        "geometry_check": {
+            "face_area_ratio": geo_result.face_area_ratio,
+            "face_width_ratio": geo_result.face_width_ratio,
+            "frame_aspect_ratio": geo_result.frame_aspect_ratio,
+        }
+    }
+
+
 def _run_single(image_bgr: np.ndarray) -> dict:
-    """Detect face + predict liveness for a single image."""
+    """Detect face + (Layer 0a geometry gate) + predict liveness for a single image."""
     bbox = detector.detect(image_bgr)
     if bbox is None:
         return {
@@ -284,6 +344,17 @@ def _run_single(image_bgr: np.ndarray) -> dict:
             "score": 0.0,
             "threshold": settings.LIVENESS_THRESHOLD,
             "face_detected": False,
+        }
+
+    geo_result = _run_geometry_gate(bbox, image_bgr)
+    if geo_result is not None:
+        return {
+            "is_real": False,
+            "label": "document_photo",
+            "score": round(geo_result.face_area_ratio, 4),
+            "threshold": settings.FACE_RATIO_REJECT,
+            "face_detected": True,
+            "signals": _geometry_signals(geo_result),
         }
 
     label, score, face_detected, signal_info = engine.predict(image_bgr, bbox)
@@ -379,6 +450,21 @@ async def verify_batch(images: list[UploadFile] = File(...)) -> dict:
                            "threshold": settings.LIVENESS_THRESHOLD,
                            "face_detected": False}
         else:
+            # Layer 0a geometry gate — per-frame, BEFORE this frame is added
+            # to the liveness batch. A hit short-circuits this frame only;
+            # other frames in the batch are unaffected.
+            geo_result = _run_geometry_gate(bbox, img)
+            if geo_result is not None:
+                results[i] = {
+                    "is_real": False,
+                    "label": "document_photo",
+                    "score": round(geo_result.face_area_ratio, 4),
+                    "threshold": settings.FACE_RATIO_REJECT,
+                    "face_detected": True,
+                    "signals": _geometry_signals(geo_result),
+                }
+                continue
+
             from app.liveness import _crop_face
             scale = engine._models[0][3] if engine._models else None
             crop = _crop_face(img, bbox, scale, 224, 224)
@@ -426,7 +512,13 @@ async def spoof_server(req: SpoofRequest) -> dict:
 
     elapsed = round(time.perf_counter() - t0, 3)
     is_spoof = 0 if result["is_real"] else 1
-    return {"elapsed_time": elapsed, "is_spoof": is_spoof}
+    response: dict = {"elapsed_time": elapsed, "is_spoof": is_spoof}
+    # Additive-only field — existing consumers reading elapsed_time/is_spoof
+    # are unaffected; present only when Layer 0a geometry gate fired
+    # (result["label"] == "document_photo", see _run_single).
+    if result.get("label") == "document_photo":
+        response["reason"] = "DOCUMENT_PHOTO"
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -448,7 +540,7 @@ class PadCheckResponse(BaseModel):
     verdict: Literal["live", "spoof", "low_quality"] = Field(...)
     reason: Optional[str] = Field(
         None,
-        description="PASSIVE_PAD_SPOOF | NO_FACE | LOW_QUALITY | TIMEOUT | INTERNAL_ERROR | null",
+        description="PASSIVE_PAD_SPOOF | DOCUMENT_PHOTO | NO_FACE | LOW_QUALITY | TIMEOUT | INTERNAL_ERROR | null",
     )
     score: float = Field(..., description="Confidence score [0..1]")
     threshold: float = Field(..., description="Liveness threshold used for this decision")
@@ -538,6 +630,78 @@ async def pad_check(
             threshold=settings.LIVENESS_THRESHOLD, face_detected=False,
             save_frame=False, signals={}, model_version=MODEL_VERSION, processing_ms=ms,
         )
+
+    # Layer 0a — deterministic face-to-frame geometry gate (runs BEFORE
+    # passive-PAD and before the minicpm-v Layer 0b below). Shared helper
+    # (_run_geometry_gate) reuses the SAME bbox just computed above — no
+    # extra model, no network call, microseconds. See app/geometry_check.py
+    # for calibration numbers and known limitations (n=1 spoof sample,
+    # evadable by a smarter attacker who does not fill the frame). Fail-safe:
+    # any bad input (should not happen given a real bbox) falls straight
+    # through to passive-PAD.
+    geo_result = _run_geometry_gate(bbox, img)
+    if geo_result is not None:
+        ms = round((time.perf_counter() - t0) * 1000, 1)
+        geo_signals = _geometry_signals(geo_result)
+        _audit_entry(
+            req.correlation_id, req.transaction_type, req.transaction_ref,
+            "spoof", geo_result.face_area_ratio, geo_signals, ms, True, reason="DOCUMENT_PHOTO",
+        )
+        log.info(
+            "PAD check: correlation=%s verdict=spoof reason=DOCUMENT_PHOTO "
+            "face_area_ratio=%.3f ms=%.1f txn=%s",
+            req.correlation_id, geo_result.face_area_ratio, ms, req.transaction_ref,
+        )
+        return PadCheckResponse(
+            verdict="spoof", reason="DOCUMENT_PHOTO", score=round(geo_result.face_area_ratio, 4),
+            threshold=settings.FACE_RATIO_REJECT, face_detected=True,
+            save_frame=True, signals=geo_signals, model_version=MODEL_VERSION, processing_ms=ms,
+        )
+    # Below threshold, not ran (disabled or bad input) — continue unchanged.
+
+    # Layer 0b — document/passport-photo pre-filter via minicpm-v (runs BEFORE
+    # passive-PAD). DEFAULT DISABLED (see app/document_check.py for why).
+    # Ortho signal: catches studio/ID-style composition (plain backdrop,
+    # matted cutout, passport pose) that the texture/frequency-based
+    # passive-PAD signals do not target. Fail-open unconditionally: any
+    # non-"ran" result (disabled, Ollama down, timeout, unparseable) falls
+    # straight through to passive-PAD below, unchanged.
+    if settings.DOCUMENT_CHECK_ENABLED:
+        try:
+            doc_result = await asyncio.wait_for(
+                asyncio.to_thread(document_checker.check, img),
+                timeout=settings.DOCUMENT_CHECK_TIMEOUT_S + 1.0,
+            )
+        except asyncio.TimeoutError:
+            log.warning(
+                "document_check: outer timeout for correlation=%s — failing open to passive-PAD",
+                req.correlation_id,
+            )
+            doc_result = None
+
+        if doc_result is not None and doc_result.ran and doc_result.is_document \
+                and doc_result.confidence >= settings.DOCUMENT_REJECT_THRESHOLD:
+            ms = round((time.perf_counter() - t0) * 1000, 1)
+            doc_signals = {
+                "document_check": {
+                    "label": doc_result.raw_label,
+                    "confidence": round(doc_result.confidence, 4),
+                }
+            }
+            _audit_entry(
+                req.correlation_id, req.transaction_type, req.transaction_ref,
+                "spoof", doc_result.confidence, doc_signals, ms, True, reason="DOCUMENT_PHOTO",
+            )
+            log.info(
+                "PAD check: correlation=%s verdict=spoof reason=DOCUMENT_PHOTO confidence=%.3f ms=%.1f txn=%s",
+                req.correlation_id, doc_result.confidence, ms, req.transaction_ref,
+            )
+            return PadCheckResponse(
+                verdict="spoof", reason="DOCUMENT_PHOTO", score=round(doc_result.confidence, 4),
+                threshold=settings.DOCUMENT_REJECT_THRESHOLD, face_detected=True,
+                save_frame=True, signals=doc_signals, model_version=MODEL_VERSION, processing_ms=ms,
+            )
+        # Below threshold, not ran, or fail-open — continue to passive-PAD unchanged.
 
     # Run liveness with 2-second timeout (1.4)
     try:

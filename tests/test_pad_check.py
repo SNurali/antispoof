@@ -170,6 +170,238 @@ class TestPadCheckHappyPath:
 
 
 # ---------------------------------------------------------------------------
+# POST /pad/check — Layer 0a deterministic face-to-frame geometry gate
+# ---------------------------------------------------------------------------
+
+class TestPadCheckGeometryLayer:
+    def test_large_face_ratio_short_circuits_to_document_photo(self, client):
+        """A bbox filling most of the frame (document-photo profile, per the
+        incident_urgut spoof calibration: ratio 0.472) => verdict=spoof,
+        reason=DOCUMENT_PHOTO, WITHOUT ever calling passive-PAD."""
+        import app.main as m
+
+        # 200x200 frame (from _make_test_image), bbox covering 70% width/height
+        # => area ratio = 0.49, above the default 0.35 threshold.
+        m.detector.detect.return_value = [10, 10, 140, 140]
+        try:
+            with patch.object(m.engine, "predict") as mock_predict:
+                resp = client.post("/pad/check", json={
+                    "correlation_id": "test-geo-reject",
+                    "transaction_type": "sale",
+                    "transaction_ref": "req:bal",
+                    "face_photo": _make_base64_image(),
+                })
+            mock_predict.assert_not_called()
+        finally:
+            m.detector.detect.return_value = [50, 50, 100, 100]
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["verdict"] == "spoof"
+        assert data["reason"] == "DOCUMENT_PHOTO"
+        assert data["save_frame"] is True
+        assert data["signals"]["geometry_check"]["face_area_ratio"] == pytest.approx(0.49)
+
+    def test_normal_selfie_face_ratio_falls_through_to_passive_pad(self, client):
+        """Default fixture bbox [50,50,100,100] on a 200x200 frame => ratio
+        0.25, below threshold — must NOT be rejected by the geometry layer;
+        passive-PAD's verdict (mocked 'real') is what's returned."""
+        resp = client.post("/pad/check", json={
+            "correlation_id": "test-geo-pass",
+            "transaction_type": "sale",
+            "transaction_ref": "req:bal",
+            "face_photo": _make_base64_image(),
+        })
+        assert resp.status_code == 200
+        assert resp.json()["verdict"] == "live"
+
+    def test_disabled_flag_skips_geometry_layer_even_with_large_face(self, client):
+        """GEOMETRY_CHECK_ENABLED=False => large-face frames must NOT be
+        rejected by this layer; passive-PAD alone decides."""
+        import app.main as m
+
+        m.settings.GEOMETRY_CHECK_ENABLED = False
+        m.detector.detect.return_value = [10, 10, 140, 140]  # ratio 0.49, would reject if enabled
+        try:
+            resp = client.post("/pad/check", json={
+                "correlation_id": "test-geo-disabled",
+                "transaction_type": "sale",
+                "transaction_ref": "req:bal",
+                "face_photo": _make_base64_image(),
+            })
+        finally:
+            m.settings.GEOMETRY_CHECK_ENABLED = True
+            m.detector.detect.return_value = [50, 50, 100, 100]
+
+        assert resp.status_code == 200
+        assert resp.json()["verdict"] == "live"  # falls through to mocked passive-PAD
+
+    def test_malformed_bbox_fails_safe_to_passive_pad(self, client):
+        """A detector bbox the geometry check can't process must not crash
+        the request — falls through to passive-PAD unchanged."""
+        import app.main as m
+
+        m.detector.detect.return_value = [0, 0, 0, 0]  # triggers INVALID_DIMENSIONS
+        try:
+            resp = client.post("/pad/check", json={
+                "correlation_id": "test-geo-malformed",
+                "transaction_type": "sale",
+                "transaction_ref": "req:bal",
+                "face_photo": _make_base64_image(),
+            })
+        finally:
+            m.detector.detect.return_value = [50, 50, 100, 100]
+
+        assert resp.status_code == 200
+        assert resp.json()["verdict"] == "live"
+
+
+# ---------------------------------------------------------------------------
+# POST /pad/check — Layer 0b document/passport-photo pre-filter (minicpm-v)
+# ---------------------------------------------------------------------------
+
+class TestPadCheckDocumentLayer:
+    def test_disabled_by_default_never_calls_document_checker(self, client):
+        """DOCUMENT_CHECK_ENABLED defaults to False — the layer must not run
+        at all (and passive-PAD behavior must be untouched) unless explicitly
+        turned on."""
+        import app.main as m
+        assert m.settings.DOCUMENT_CHECK_ENABLED is False
+
+        with patch.object(m.document_checker, "check") as mock_check:
+            resp = client.post("/pad/check", json={
+                "correlation_id": "test-doc-disabled",
+                "transaction_type": "sale",
+                "transaction_ref": "req:bal",
+                "face_photo": _make_base64_image(),
+            })
+        assert resp.status_code == 200
+        mock_check.assert_not_called()
+
+    def test_enabled_high_confidence_document_short_circuits_to_spoof(self, client):
+        """Layer 0 confidently flags a document photo => verdict=spoof,
+        reason=DOCUMENT_PHOTO, WITHOUT ever calling passive-PAD (engine.predict)."""
+        import app.main as m
+        from app.document_check import DocumentCheckResult
+
+        m.settings.DOCUMENT_CHECK_ENABLED = True
+        m.settings.DOCUMENT_REJECT_THRESHOLD = 0.70
+        try:
+            with patch.object(
+                m.document_checker, "check",
+                return_value=DocumentCheckResult(
+                    ran=True, is_document=True, confidence=0.92,
+                    raw_label="STUDIO_BACKGROUND", raw_response="LABEL=STUDIO_BACKGROUND CONFIDENCE=92",
+                ),
+            ), patch.object(m.engine, "predict") as mock_predict:
+                resp = client.post("/pad/check", json={
+                    "correlation_id": "test-doc-reject",
+                    "transaction_type": "sale",
+                    "transaction_ref": "req:bal",
+                    "face_photo": _make_base64_image(),
+                })
+            mock_predict.assert_not_called()
+        finally:
+            m.settings.DOCUMENT_CHECK_ENABLED = False
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["verdict"] == "spoof"
+        assert data["reason"] == "DOCUMENT_PHOTO"
+        assert data["save_frame"] is True
+        assert data["signals"]["document_check"]["label"] == "STUDIO_BACKGROUND"
+
+    def test_enabled_below_threshold_falls_through_to_passive_pad(self, client):
+        """Confidence below DOCUMENT_REJECT_THRESHOLD => must NOT short-circuit;
+        passive-PAD still runs and its verdict is what's returned."""
+        import app.main as m
+        from app.document_check import DocumentCheckResult
+
+        m.settings.DOCUMENT_CHECK_ENABLED = True
+        m.settings.DOCUMENT_REJECT_THRESHOLD = 0.70
+        try:
+            with patch.object(
+                m.document_checker, "check",
+                return_value=DocumentCheckResult(
+                    ran=True, is_document=True, confidence=0.40,
+                    raw_label="STUDIO_BACKGROUND", raw_response="LABEL=STUDIO_BACKGROUND CONFIDENCE=40",
+                ),
+            ):
+                resp = client.post("/pad/check", json={
+                    "correlation_id": "test-doc-below-threshold",
+                    "transaction_type": "sale",
+                    "transaction_ref": "req:bal",
+                    "face_photo": _make_base64_image(),
+                })
+        finally:
+            m.settings.DOCUMENT_CHECK_ENABLED = False
+
+        assert resp.status_code == 200
+        data = resp.json()
+        # Falls through to the mocked passive-PAD engine ("real", 0.95 from `client` fixture)
+        assert data["verdict"] == "live"
+
+    def test_enabled_ollama_unavailable_fails_open_to_passive_pad(self, client):
+        """Layer 0 fails (ran=False) => must fall through to passive-PAD
+        unchanged, never surface an error to the caller."""
+        import app.main as m
+        from app.document_check import DocumentCheckResult
+
+        m.settings.DOCUMENT_CHECK_ENABLED = True
+        try:
+            with patch.object(
+                m.document_checker, "check",
+                return_value=DocumentCheckResult(ran=False, error="OLLAMA_UNAVAILABLE: connection refused"),
+            ):
+                resp = client.post("/pad/check", json={
+                    "correlation_id": "test-doc-failopen",
+                    "transaction_type": "sale",
+                    "transaction_ref": "req:bal",
+                    "face_photo": _make_base64_image(),
+                })
+        finally:
+            m.settings.DOCUMENT_CHECK_ENABLED = False
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["verdict"] == "live"  # passive-PAD's mocked verdict, untouched
+
+    def test_enabled_outer_timeout_fails_open_to_passive_pad(self, client):
+        """Even if the checker call itself hangs past the outer asyncio timeout,
+        /pad/check must still resolve via passive-PAD, not hang or error.
+        (The underlying thread is not killed — Python threads can't be — but
+        the request path must not wait for it; it abandons and moves on.)"""
+        import app.main as m
+        import time as _time
+
+        m.settings.DOCUMENT_CHECK_ENABLED = True
+        m.settings.DOCUMENT_CHECK_TIMEOUT_S = 0.05  # outer wait = 1.05s
+        try:
+            def _slow_check(*_a, **_kw):
+                _time.sleep(2.0)
+                from app.document_check import DocumentCheckResult
+                return DocumentCheckResult(ran=True, is_document=True, confidence=0.99)
+
+            with patch.object(m.document_checker, "check", side_effect=_slow_check):
+                t0 = _time.monotonic()
+                resp = client.post("/pad/check", json={
+                    "correlation_id": "test-doc-outer-timeout",
+                    "transaction_type": "sale",
+                    "transaction_ref": "req:bal",
+                    "face_photo": _make_base64_image(),
+                })
+                elapsed = _time.monotonic() - t0
+        finally:
+            m.settings.DOCUMENT_CHECK_ENABLED = False
+            m.settings.DOCUMENT_CHECK_TIMEOUT_S = 20.0
+
+        assert resp.status_code == 200
+        assert elapsed < 2.0, "request must not block for the full slow-checker duration"
+        data = resp.json()
+        assert data["verdict"] == "live"
+
+
+# ---------------------------------------------------------------------------
 # POST /pad/check — auth
 # ---------------------------------------------------------------------------
 
