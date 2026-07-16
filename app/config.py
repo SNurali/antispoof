@@ -47,23 +47,42 @@ class Settings(BaseSettings):
     # disabled, without a code change.
     DOCUMENT_CHECK_TIMEOUT_S: float = 20.0
 
-    # Layer 0a — deterministic face-to-frame geometry gate (RZA, 2026-07-16).
-    # Reuses the SAME RetinaFace bbox passive-PAD already computes — no extra
-    # model, no network call, microseconds. See app/geometry_check.py module
-    # docstring for full calibration numbers and limitations before trusting
-    # this in production.
+    # Layer 0a — deterministic face-to-frame geometry gate (RZA, 2026-07-16,
+    # RE-CALIBRATED 2026-07-16 evening after a second real incident slipped
+    # through the original 0.35 threshold — see app/geometry_check.py module
+    # docstring for the full numbers). Reuses the SAME RetinaFace bbox
+    # passive-PAD already computes — no extra model, no network call,
+    # microseconds.
     #
-    # Calibrated on incident_urgut with the REAL FaceDetector bbox:
-    #   spoof (passport_style_spoof_01.jpg):  face_area_ratio = 0.472
-    #   bonafide (12 files):                  face_area_ratio = 0.043 .. 0.215
-    # 0.35 sits with ~63% margin above the bonafide max and ~26% margin below
-    # the (single) spoof sample. DEFAULT ENABLED: unlike the minicpm-v layer,
-    # this is free (no latency/availability risk) and the calibration margin
-    # is clean — but it is based on n=1 spoof sample and a bonafide set of
-    # phone selfies, NOT verified sale-transaction camera frames. Re-check
-    # against real sale-flow frames when available.
+    # Calibrated on incident_urgut + the 2026-07-16 19:41 incident photo, all
+    # with the REAL FaceDetector bbox:
+    #   bonafide (12 files):     face_area_ratio 0.043-0.215
+    #   document spoof (n=2):    face_area_ratio 0.322/0.472
+    # 0.27 sits ~26% above the bonafide area-ratio max and ~16% below the
+    # weaker of the two known spoofs (was 0.35 — too high, let the 0.3224
+    # incident through). This is the ONLY ratio wired into the reject
+    # decision (see app/main.py::_run_geometry_gate). DEFAULT ENABLED: unlike
+    # the minicpm-v layer this is free (no latency/availability risk) — but
+    # calibration is still n=12 bonafide / n=2 document-spoof phone photos,
+    # NOT verified sale-transaction camera frames; production camera may sit
+    # closer to the customer and shift the bonafide baseline upward. Re-check
+    # against real sale-flow frames before trusting the FRR this implies.
     GEOMETRY_CHECK_ENABLED: bool = True
-    FACE_RATIO_REJECT: float = 0.35
+    FACE_RATIO_REJECT: float = 0.27
+
+    # DIAGNOSTIC ONLY — NOT wired into the reject decision (2PAC review,
+    # 2026-07-16: `face_width_ratio` is empirically ~1.09*sqrt(face_area_ratio)
+    # on every one of the 14 calibration samples measured so far, so gating
+    # on width in addition to area does not catch any attack area misses —
+    # it only tightens the effective margin against a real customer standing
+    # close to the camera, i.e. pure FRR cost with no FAR benefit on current
+    # data). `face_width_ratio` is still computed and reported in
+    # `signals.geometry_check` for every request (like `frame_aspect_ratio`)
+    # so a future, larger, independently-collected sample can re-evaluate it
+    # as a genuinely orthogonal signal. This constant is kept only so that
+    # value is available if/when that recalibration wires it back in — do
+    # not read it as an active threshold today.
+    FACE_WIDTH_RATIO_REJECT: float = 0.55
 
     # CORS (MF DOOM review, 2026-07-16): DEFAULT EMPTY = middleware not
     # attached at all — no CORS headers, no wildcard attack surface. The

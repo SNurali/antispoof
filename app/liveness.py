@@ -13,11 +13,27 @@ import torch.nn.functional as F
 
 from app.multisignal import analyze_face, SIGNAL_WEIGHTS, RECAPTURE_SPOOF_THRESHOLD
 
-# Above this NN real-confidence, trust the trained CNN over the resolution-
-# sensitive `recapture` cue. Rationale from testing: genuine photo/screen fakes
-# never pushed the CNN past ~0.85 real-confidence, while a live (even low-res)
-# webcam face scores ~0.99. Gating the recapture override on this stops
-# false-rejecting real low-res captures without letting file-based fakes pass.
+# HISTORICAL CONSTANT — no longer read anywhere in `_fuse` (MF DOOM review,
+# 2026-07-16: the `nn_very_confident_real` variable that used to gate on
+# this was removed from the recapture-override branch below, and it was
+# never computed/logged anywhere else — this constant is currently dead
+# code). Kept only as a documented data point (0.90 was the confidence line
+# the old, now-disproven, veto used) in case a future revision wants to
+# reintroduce a similar guard with new evidence. Do not resurrect a
+# `not nn_very_confident_real` condition on the recapture branch without
+# re-reading the incident fix below first.
+#
+# Above this NN real-confidence, the OLD code trusted the trained CNN over
+# the resolution-sensitive `recapture` cue. Rationale from testing: genuine
+# photo/screen fakes never pushed the CNN past ~0.85 real-confidence, while
+# a live (even low-res) webcam face scores ~0.99. That assumption was
+# DISPROVEN 2026-07-16: a high-quality passport-style photo spoof
+# (docs/plans/calibration/incident_urgut/urgut_v2_passport/passport_style_spoof_01.jpg,
+# and again same-day with a second incident photo) scored nn_score=0.9909 /
+# 0.9997 — comfortably above this 0.90 line — while `recapture` (0.631 /
+# 0.541) correctly flagged it AND was confirmed by `lbp` (0.300 in both
+# cases). The veto let both spoofs through with combined_label=real. See
+# `_fuse` below for the fix.
 NN_TRUST_REAL = 0.90
 
 # Below this NN spoof-confidence, the raw CNN call is treated as "weak, not a
@@ -37,11 +53,12 @@ SIGNAL_TRUST_REAL_MAX = 0.20
 def _fuse(nn_label: int, nn_score: float, signal_info: dict) -> tuple[str, float]:
     """Combine NN output with multi-signal analysis into a final verdict.
 
-    A high `recapture` score is a physical, upscale-robust cue that the frame is
-    a low-detail screen/print recapture; it overrides the NN "real" verdict
-    (this is exactly the class of fake the NN misses) — UNLESS the CNN is very
-    confident the face is real, which genuine fakes never achieve. Otherwise
-    fall back to the NN, letting weaker signals tip borderline cases to spoof.
+    A high `recapture` score (confirmed by `lbp`/`moire`) is a physical,
+    upscale-robust cue that the frame is a low-detail screen/print recapture;
+    it OVERRIDES the NN "real" verdict unconditionally (this is exactly the
+    class of fake the NN misses — see the 2026-07-16 fix below for why this
+    is no longer gated on NN confidence). Otherwise fall back to the NN,
+    letting weaker signals tip borderline cases to spoof.
 
     2026-07-06 incident fix: a real phone selfie re-compressed by a messenger
     (960x1280, 148KB vs 180-370KB for the same resolution in the calibration
@@ -63,6 +80,30 @@ def _fuse(nn_label: int, nn_score: float, signal_info: dict) -> tuple[str, float
     varied texture), the override no longer catches them and we fall through
     to the NN — this is a real trade-off, not eliminated, only reduced;
     n=10/11 calibration set is a smoke test (README caveat), not a guarantee.
+
+    2026-07-16 19:41 incident fix (`NN_TRUST_REAL` veto removed from this
+    branch): a high-quality passport-style photo held up to the camera hit
+    recap=0.541/0.631 (>= RECAPTURE_SPOOF_THRESHOLD) with recapture_confirmed
+    True (lbp=0.300 > 0.1) — by design this should have returned "spoof" —
+    but the CNN itself scored nn_score=0.9997/0.9909 (real), tripping the old
+    `not nn_very_confident_real` veto (NN_TRUST_REAL=0.90) and falling
+    through to `return "real", nn_score`. Verified `combined_label=real,
+    combined_score=0.9997` reproduced with the OLD code on the real incident
+    photo before this fix (see calibration table in
+    docs/plans/calibration/incident_urgut/). The veto is now REMOVED from
+    this branch: on the full calibration set (12 bonafide + 11 "urgut"
+    print/screen attacks + 2 passport-style photo attacks, all measured with
+    the real FaceDetector + LivenessEngine), every single bonafide sample has
+    lbp=0.0 (=> recapture_confirmed=False regardless of NN confidence) — so
+    removing the veto changes ZERO bonafide verdicts on known data while
+    fixing both passport-style spoofs. Risk (documented, not eliminated): a
+    genuine low-res live capture that somehow also trips lbp/moire (texture
+    signals, computed on a DIFFERENT 160x160 downscaled crop than
+    `recapture`'s native-res crop) would now hard-reject instead of being
+    saved by NN confidence — no such case exists in the current calibration
+    set, but the risk is real given only n=12 bonafide. Owner's directive
+    (2026-07-16) is to bias toward this trade-off: reject a borderline live
+    frame over letting a document spoof through.
     """
     recap = signal_info["signal_scores"].get("recapture", 0.0)
     spoof_prob = signal_info["spoof_probability"]
@@ -70,8 +111,7 @@ def _fuse(nn_label: int, nn_score: float, signal_info: dict) -> tuple[str, float
     moire = signal_info["signal_scores"].get("moire", 0.0)
     recapture_confirmed = lbp > 0.1 or moire > 0.1
 
-    nn_very_confident_real = nn_label == 1 and nn_score >= NN_TRUST_REAL
-    if recap >= RECAPTURE_SPOOF_THRESHOLD and recapture_confirmed and not nn_very_confident_real:
+    if recap >= RECAPTURE_SPOOF_THRESHOLD and recapture_confirmed:
         return "spoof", max(recap, spoof_prob)
     if nn_label != 1:
         # 2026-07-06 incident fix #2: a real outdoor selfie (bright sun, bald

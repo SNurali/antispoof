@@ -314,6 +314,15 @@ def _run_geometry_gate(bbox: list[int], image_bgr: np.ndarray) -> Optional[Geome
     shape), or `None` when the gate is disabled, did not run (bad input —
     should not happen with a real bbox), or did not flag the frame (caller
     falls through to passive-PAD unchanged). Never raises.
+
+    2026-07-16 2PAC review: `width_threshold` is deliberately NOT passed
+    here. `face_width_ratio` is ~1.09*sqrt(face_area_ratio) on every sample
+    measured so far (see app/geometry_check.py docstring) — gating on it too
+    does not catch any attack area_ratio misses, it only tightens the
+    effective margin against real bonafide near a close-up camera (pure FRR
+    cost, no FAR benefit). `face_width_ratio` is still computed and reported
+    as a diagnostic-only field (see `_geometry_signals`) for future
+    independent calibration; it is not part of the reject decision.
     """
     if not settings.GEOMETRY_CHECK_ENABLED:
         return None

@@ -181,7 +181,8 @@ class TestPadCheckGeometryLayer:
         import app.main as m
 
         # 200x200 frame (from _make_test_image), bbox covering 70% width/height
-        # => area ratio = 0.49, above the default 0.35 threshold.
+        # => area ratio = 0.49, above the default 0.27 threshold (re-calibrated
+        # 2026-07-16, see app/config.py).
         m.detector.detect.return_value = [10, 10, 140, 140]
         try:
             with patch.object(m.engine, "predict") as mock_predict:
@@ -203,9 +204,11 @@ class TestPadCheckGeometryLayer:
         assert data["signals"]["geometry_check"]["face_area_ratio"] == pytest.approx(0.49)
 
     def test_normal_selfie_face_ratio_falls_through_to_passive_pad(self, client):
-        """Default fixture bbox [50,50,100,100] on a 200x200 frame => ratio
-        0.25, below threshold — must NOT be rejected by the geometry layer;
-        passive-PAD's verdict (mocked 'real') is what's returned."""
+        """Default fixture bbox [50,50,100,100] on a 200x200 frame => area
+        ratio 0.25 (below the 0.27 area threshold) and width ratio 0.5
+        (below the 0.55 width threshold) — must NOT be rejected by the
+        geometry layer; passive-PAD's verdict (mocked 'real') is what's
+        returned."""
         resp = client.post("/pad/check", json={
             "correlation_id": "test-geo-pass",
             "transaction_type": "sale",
