@@ -1,0 +1,11 @@
+# Git LFS — liveness model weights (new, added by RZA's liveness increment).
+# Scoped to models/liveness/ only: the pre-existing models/*.pth and
+# models/detection_model/*.caffemodel files are already regular git blobs
+# committed to history and are left untouched (out of scope for this change;
+# retroactively moving them to LFS would need `git lfs migrate` on shared
+# history — a separate decision for the repo owner).
+models/liveness/*.onnx filter=lfs diff=lfs merge=lfs -text
+models/liveness/*.pt filter=lfs diff=lfs merge=lfs -text
+models/liveness/*.pth filter=lfs diff=lfs merge=lfs -text
+models/liveness/*.bin filter=lfs diff=lfs merge=lfs -text
+models/liveness/*.safetensors filter=lfs diff=lfs merge=lfs -text
