@@ -105,6 +105,170 @@ class Settings(BaseSettings):
             return [origin.strip() for origin in stripped.split(",") if origin.strip()]
         return v
 
+    # ------------------------------------------------------------------
+    # Active liveness (RZA, 2026-07-17) — POST /liveness/challenge +
+    # POST /liveness/verdict, per docs/plans/FACEID_ANTIBYPASS_UNIFIED_PLAN_v1.md
+    # Phase 2 and docs/plans/FACEID_LIVENESS_ML_CORE_v1.md Layer 0/2/3.
+    #
+    # DEFAULT DISABLED. Flipping this on pulls in NEW heavy dependencies
+    # (insightface, onnxruntime) and a 260MB ONNX weight file
+    # (models/liveness/adaface_ir101_webface12m.onnx) that are not
+    # guaranteed to be installed/provisioned on every deploy yet. When
+    # False, app/main.py must not import insightface/onnxruntime or touch
+    # the weight file at all at startup — /verify, /verify_batch,
+    # /spoof-server, /pad/check must keep working unmodified on a host
+    # that has not rolled this out.
+    LIVENESS_ENDPOINTS_ENABLED: bool = False
+
+    # SCRFD detector input size (insightface buffalo_l, detection +
+    # landmark_3d_68 submodules only — NOT the full buffalo_l pipeline, no
+    # landmark_2d_106/genderage/recognition load, see app/face_landmarks.py).
+    # 320 measured on docs/plans/calibration/incident_urgut (12 bonafide +
+    # 12 spoof, single-photo, NOT session frames): ~100-160ms/frame on
+    # i5-11400 CPU after model load. See app/face_landmarks.py docstring.
+    LIVENESS_DET_SIZE: int = 320
+
+    # AdaFace embedder for Layer 3 cross-frame identity consistency.
+    # MEASURED, NOT the model ML_CORE §2.3/§7 recommended: that document
+    # explicitly argues for AdaFace IR-18 or IR-50 over IR-101 on CPU
+    # latency grounds, but no IR-18/IR-50 checkpoint exists in this repo or
+    # the sibling face_id/tracker project today — only the IR-101 ONNX
+    # (adaface_ir101_webface12m.onnx, reused from face_id/tracker/weights/,
+    # already CPU-turbo-proven there for a DIFFERENT latency budget: a
+    # live door-camera stream, not a <2s synchronous HTTP call). Measured
+    # HERE on this repo's calibration set (2026-07-17, i5-11400, 12
+    # threads, onnxruntime CPUExecutionProvider):
+    #   steady-state (warm session, explicit intra_op_num_threads=12):
+    #       ~342ms/frame
+    #   cold/mixed average across 24 single-shot calls (no warmup
+    #       amortization — closer to what an idle low-QPS internal service
+    #       actually pays per call): ~524ms/frame
+    # At 4-6 key frames/session this is ~1.4-3.1s for embeddings ALONE,
+    # before SCRFD detection (~100-160ms/frame) or the existing Layer 1
+    # passive-PAD pass (~20ms/frame, already measured in
+    # FACEID_PHASE1_PAD_GATE.md §3). Do not treat this as a finished
+    # decision — it is the SAME risk ML_CORE flagged, now with real
+    # numbers instead of a guess. Swapping to IR-18/50 (or moving this
+    # service to GPU) is the clear next step once a lighter checkpoint is
+    # available; this constant exists so that swap is an env change, not a
+    # code change.
+    ADAFACE_ONNX_PATH: Path = Path(__file__).resolve().parent.parent / "models" / "liveness" / "adaface_ir101_webface12m.onnx"
+
+    # Layer 3 cross-frame identity — UNCALIBRATED. ML_CORE §2.3 cites a
+    # literature-only working hypothesis (cosine >= ~0.4-0.5 same-person
+    # for ArcFace/AdaFace-family embeddings under same-session conditions).
+    # Attempted to calibrate this on docs/plans/calibration/incident_urgut
+    # (2026-07-17): that dataset turned out to be single photos of
+    # DIFFERENT people (not repeat captures of one person across a
+    # session) — confirmed by pipeline self-consistency checks (identical
+    # input embedded twice -> cosine=1.0, mirror-flip of the same face ->
+    # 0.962, same crop re-encoded at JPEG q80 -> 0.980, all sane) followed
+    # by cross-file cosine on the actual calibration images, which came
+    # back near-zero (bonafide-bonafide pairs: min=-0.079, max=0.203,
+    # mean=0.058 — nowhere near a same-person range). This is NOT a
+    # pipeline bug; it means the calibration set cannot answer the
+    # question Layer 3 needs answered. Kept at the ML_CORE literature
+    # floor (0.40) rather than inventing a new number — genuinely
+    # UNCALIBRATED, needs a real same-session multi-frame corpus (see
+    # ML_CORE §6.2 item 1, "bona fide corpus") before this can be trusted
+    # as a security threshold rather than a placeholder.
+    IDENTITY_MIN: float = 0.40
+
+    # Layer 2 active challenge — randomization pool. BLINK is now IMPLEMENTED
+    # (2026-07-17, app/active_challenge.py + app/face_landmarks.py::
+    # eye_aspect_ratios) using EAR from the SAME landmark_3d_68 model already
+    # loaded for pose — no landmark_2d_106, no MediaPipe, no new dependency.
+    # The EYE-CONTOUR INDEX MAPPING (36-41 right eye, 42-47 left eye — the
+    # standard dlib/iBUG-300W 68-point convention landmark_3d_68 is fit to)
+    # was VERIFIED against a real photo, not assumed — see
+    # FrameFace.landmark_68 docstring in app/face_landmarks.py.
+    #
+    # BLINK IS DELIBERATELY STILL EXCLUDED FROM THIS POOL, though: index
+    # correctness and THRESHOLD calibration (LIVENESS_EAR_BLINK_MAX below)
+    # are different questions, and only the first one is solved. ML_CORE
+    # §2.2 already flagged its own EAR threshold as "typical value from
+    # literature ... NOT calibrated under our camera/resolution —
+    # placeholder"; shipping an uncalibrated BLINK gate as an ACTIVE
+    # security control (default pool member) is exactly the "don't lower
+    # FAR for a good-looking number" trap the honesty rules warn against.
+    # Detection stays reachable (a caller can put "BLINK" in a session's
+    # own steps) for exactly this future recalibration to build on, without
+    # a second implementation pass.
+    LIVENESS_CHALLENGE_STEPS_POOL: str = "TURN_LEFT,TURN_RIGHT"
+    # How many steps to sample from the pool per session. With only 2
+    # supported steps today the entropy against a pre-recorded video-replay
+    # attack is low (2 possible orders = 1 bit) — ML_CORE §2.2 calls
+    # exactly this out as the reason randomization exists at all; 1 bit is
+    # a real but weak deterrent until BLINK (or another distinguishable
+    # step) is added. Tracked as an explicit known limitation, not silently
+    # accepted as "good enough".
+    LIVENESS_CHALLENGE_STEP_COUNT: int = 2
+
+    # Required yaw deviation (degrees) from the frontal reference for a
+    # TURN_LEFT/TURN_RIGHT step to count as satisfied. ML_CORE §2.2's own
+    # number (+/-20 deg), carried over UNVERIFIED against real device/pose
+    # convention — see app/active_challenge.py module docstring for the
+    # sign-convention caveat (which physical direction maps to positive
+    # yaw has not been confirmed with a labeled real capture).
+    LIVENESS_YAW_TURN_MIN_DEG: float = 20.0
+    # Max |yaw| for a frame to count as the frontal reference/return-to-
+    # center. Placeholder, not calibrated.
+    LIVENESS_YAW_FRONTAL_MAX_DEG: float = 10.0
+
+    # BLINK closed-eye cutoff for min(right_ear, left_ear) — see
+    # app/active_challenge.py + app/face_landmarks.py::eye_aspect_ratios.
+    # UNCALIBRATED: 0.20 is the widely-cited literature value (Soukupová &
+    # Čech 2016; the pyimagesearch EAR-blink tutorial most implementations
+    # trace back to), NOT measured on this camera/landmark-model domain — no
+    # real closed-eye frame exists in this repo to calibrate against (only
+    # single bonafide/spoof photos, none mid-blink). A same-domain sanity
+    # check on 3 real OPEN-eye frontal selfies (2026-07-17, i5-11400 CPU)
+    # found EAR from THIS landmark_3d_68-derived measurement ranging
+    # 0.214-0.317 — i.e. one genuinely-open eye already sits at 0.214, only
+    # 0.014 above this cutoff. That is a real warning sign the literature
+    # number may sit too close to this model's open-eye noise floor, not
+    # cosmetic — do NOT add BLINK to LIVENESS_CHALLENGE_STEPS_POOL on the
+    # strength of this constant alone; a real open+closed-eye session
+    # corpus is needed first (see final report / owner handoff for the
+    # concrete ask: a handful of people each captured performing a real
+    # blink under production-like lighting).
+    LIVENESS_EAR_BLINK_MAX: float = 0.20
+
+    # Frame count bounds per FACEID_ANTIBYPASS_UNIFIED_PLAN_v1.md §1.2
+    # ("4-6 ключевых кадров"). Below MIN -> verdict=incomplete; above MAX
+    # is rejected as a malformed request (protects against a client
+    # uploading many more frames than the protocol calls for).
+    LIVENESS_MIN_FRAMES: int = 4
+    LIVENESS_MAX_FRAMES: int = 6
+
+    # Challenge-session validity window. Session generated by
+    # POST /liveness/challenge must be consumed by POST /liveness/verdict
+    # before this many seconds elapse (matches ML_CORE §2.2 "полная сессия
+    # должна уложиться в общее окно" — exact UX duration is an open owner
+    # decision per ML_CORE §8 item 2; 90s is a generous placeholder ceiling
+    # covering the 5-6s UX target plus network/retry slack, NOT the target
+    # UX duration itself).
+    LIVENESS_SESSION_TTL_S: float = 90.0
+
+    # In-memory session store ONLY in this increment — sessions do not
+    # survive a process restart and are NOT shared across multiple uvicorn
+    # workers/replicas. Fine for a single-process dev/smoke deploy; a
+    # horizontally-scaled prod deployment (see FACEID_PHASE1_PAD_GATE.md
+    # §2 item 10, "конкурентность/процессы") needs a shared store (Redis)
+    # before this can run behind more than one worker process — tracked,
+    # not solved here.
+
+    # Inference timeout for POST /liveness/verdict — deliberately larger
+    # than /pad/check's INFERENCE_TIMEOUT_S=2.0. Derived from the measured
+    # numbers above: up to LIVENESS_MAX_FRAMES=6 key frames x
+    # (~524ms AdaFace + ~160ms SCRFD + ~20ms passive-PAD) ~= 4.2s, plus
+    # margin for JSON decode/base64 of up to 6 frames. This is a STOPGAP,
+    # not an accepted UX budget — ML_CORE §8 item 2 wants total user-facing
+    # challenge time at 5-6s, and a multi-second SERVER compute tail on top
+    # of that is a real architecture risk to escalate (see IR-101 note on
+    # ADAFACE_ONNX_PATH above), not something to quietly accept.
+    LIVENESS_INFERENCE_TIMEOUT_S: float = 8.0
+
     model_config = {"env_prefix": ""}
 
 

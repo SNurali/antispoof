@@ -6,3 +6,10 @@ opencv-python>=4.8.0,<5.0.0
 numpy>=1.24.0
 pillow>=10.0.0
 torch>=2.1.0
+
+# --- Active liveness (Phase 2, POST /liveness/challenge + /liveness/verdict) ---
+# Only imported/loaded when LIVENESS_ENDPOINTS_ENABLED=1 (app/config.py) — existing
+# /verify, /verify_batch, /spoof-server, /pad/check do not depend on these and keep
+# working on a deploy that has not installed them yet.
+insightface>=0.7.3   # SCRFD detection + landmark_3d_68 pose (buffalo_l), Layer 0/2/3
+onnxruntime>=1.16.0  # AdaFace IR-101 ONNX inference (Layer 3 cross-frame identity)

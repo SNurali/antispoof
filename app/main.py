@@ -34,11 +34,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from app.active_challenge import verify_challenge
 from app.config import Settings, resolve_device
 from app.document_check import DocumentPhotoChecker
 from app.face_detect import FaceDetector
+from app.frame_qc import assess_frame
 from app.geometry_check import GeometryCheckResult, check_face_geometry
+from app.identity_consistency import compute_identity_consistency
 from app.liveness import LivenessEngine
+from app.liveness_session import SessionStore, generate_challenge_spec
 
 # ---------------------------------------------------------------------------
 # Logging: application + audit
@@ -84,6 +88,17 @@ detector: Optional[FaceDetector] = None
 engine: Optional[LivenessEngine] = None
 gpu_name: str = "N/A"
 _models_loaded: bool = False
+
+# Active-liveness globals (Layer 0/2/3) — only constructed when
+# settings.LIVENESS_ENDPOINTS_ENABLED is True (see _load_liveness_models).
+# Typed Optional[object] rather than the real classes here so this module
+# can be imported without insightface/onnxruntime installed at all when the
+# flag is off — the real types live in app/face_landmarks.py and
+# app/adaface.py, imported lazily inside _load_liveness_models().
+landmark_detector = None
+adaface_embedder = None
+session_store = SessionStore()  # cheap (pure Python), always constructed
+_liveness_models_loaded: bool = False
 
 # Layer 0 document-photo checker — cheap to construct (holds no model
 # weights, just HTTP config), always built regardless of DOCUMENT_CHECK_ENABLED
@@ -189,6 +204,36 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
                 "processing_ms": 0.0,
             },
         )
+    # For /liveness/verdict — fail-CLOSED per FACEID_ANTIBYPASS_UNIFIED_PLAN_v1.md
+    # R1(в): an unhandled exception here must never look like "live".
+    if request.url.path == "/liveness/verdict":
+        return JSONResponse(
+            status_code=500,
+            content={
+                "verdict": "incomplete",
+                "reason": "INTERNAL_ERROR",
+                "model_version": MODEL_VERSION,
+                "frame_consistency_score": 0.0,
+                "best_frame_seq": None,
+                "session_id": None,
+                "correlation_id": None,
+                "transaction_type": None,
+                "transaction_ref": None,
+                "processing_ms": 0.0,
+                "signals": {},
+            },
+        )
+    # For /spoof-server requests, return contract-shaped error (same verdict/reason as /pad/check)
+    if request.url.path == "/spoof-server":
+        return JSONResponse(
+            status_code=500,
+            content={
+                "elapsed_time": 0.0,
+                "is_spoof": 1,  # Fail-closed: assume spoof on internal error
+                "verdict": "low_quality",
+                "reason": "INTERNAL_ERROR",
+            },
+        )
     # For /verify requests
     return JSONResponse(
         status_code=500,
@@ -271,6 +316,41 @@ def _load_models() -> None:
     engine = LivenessEngine(settings.MODEL_DIR, DEVICE)
     _models_loaded = True
     log.info("Models loaded. Ready.")
+
+    _load_liveness_models()
+
+
+def _load_liveness_models() -> None:
+    """Layer 0/2/3 models for POST /liveness/challenge + /liveness/verdict.
+
+    Deliberately separate from _load_models() above and gated on
+    settings.LIVENESS_ENDPOINTS_ENABLED — importing insightface/onnxruntime
+    and loading the 260MB AdaFace ONNX weight file must never happen (and
+    must never be able to break startup) on a deploy that has not rolled
+    this feature out. Any failure here is logged and leaves
+    _liveness_models_loaded False — /liveness/challenge and
+    /liveness/verdict then respond 503, they do not crash the whole app.
+    """
+    global landmark_detector, adaface_embedder, _liveness_models_loaded
+
+    if not settings.LIVENESS_ENDPOINTS_ENABLED:
+        log.info("LIVENESS_ENDPOINTS_ENABLED=False — /liveness/challenge and /liveness/verdict return 503.")
+        return
+
+    try:
+        from app.adaface import AdaFaceEmbedder
+        from app.face_landmarks import LandmarkDetector
+
+        landmark_detector = LandmarkDetector(det_size=settings.LIVENESS_DET_SIZE)
+        adaface_embedder = AdaFaceEmbedder(settings.ADAFACE_ONNX_PATH)
+        _liveness_models_loaded = True
+        log.info("Active-liveness models loaded (Layer 0/2/3 ready).")
+    except Exception:
+        log.exception(
+            "Failed to load active-liveness models — /liveness/* will return 503. "
+            "Existing /verify, /verify_batch, /spoof-server, /pad/check are unaffected."
+        )
+        _liveness_models_loaded = False
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +473,13 @@ async def health() -> JSONResponse:
             "gpu": gpu_name,
             "models_loaded": loaded,
             "model_version": MODEL_VERSION,
+            # Additive fields — existing consumers reading only the fields
+            # above are unaffected. /health stays 200 based on the Phase 1
+            # models above even if active-liveness failed to load; Laravel's
+            # fail-closed policy for /liveness/* is enforced by THOSE
+            # endpoints returning 503 individually, not by /health.
+            "liveness_endpoints_enabled": settings.LIVENESS_ENDPOINTS_ENABLED,
+            "liveness_models_loaded": _liveness_models_loaded,
         },
     )
 
@@ -506,8 +593,19 @@ class SpoofRequest(BaseModel):
     photo: str
 
 
-@app.post("/spoof-server")
-async def spoof_server(req: SpoofRequest) -> dict:
+class SpoofServerResponse(BaseModel):
+    """Legacy /spoof-server response — verdict field is new (2026-07-16), is_spoof/elapsed_time legacy."""
+    elapsed_time: float = Field(..., description="Server-side processing time in seconds")
+    is_spoof: int = Field(..., description="0=real, 1=spoof (backward compat)")
+    verdict: Literal["live", "spoof", "low_quality"] = Field(..., description="Verdict per FACEID_PHASE1_PAD_GATE")
+    reason: Optional[str] = Field(
+        None,
+        description="PASSIVE_PAD_SPOOF | DOCUMENT_PHOTO | NO_FACE | LOW_QUALITY | null",
+    )
+
+
+@app.post("/spoof-server", response_model=SpoofServerResponse)
+async def spoof_server(req: SpoofRequest) -> SpoofServerResponse:
     t0 = time.perf_counter()
     try:
         img_bytes = base64.b64decode(req.photo)
@@ -517,17 +615,55 @@ async def spoof_server(req: SpoofRequest) -> dict:
     _validate_image_size(img_bytes)
     img = _read_image(img_bytes)
     _validate_image_dimensions(img)
+
+    # Models ready? (service-side failure — fail-closed)
+    if not _models_loaded or detector is None or engine is None:
+        elapsed = round(time.perf_counter() - t0, 3)
+        return SpoofServerResponse(
+            elapsed_time=elapsed,
+            is_spoof=1,  # Fail-closed
+            verdict="low_quality",
+            reason="INTERNAL_ERROR",
+        )
+
     result = _run_single(img)
 
     elapsed = round(time.perf_counter() - t0, 3)
     is_spoof = 0 if result["is_real"] else 1
-    response: dict = {"elapsed_time": elapsed, "is_spoof": is_spoof}
-    # Additive-only field — existing consumers reading elapsed_time/is_spoof
-    # are unaffected; present only when Layer 0a geometry gate fired
-    # (result["label"] == "document_photo", see _run_single).
-    if result.get("label") == "document_photo":
-        response["reason"] = "DOCUMENT_PHOTO"
-    return response
+
+    # Map to verdict enum per FACEID_PHASE1_PAD_GATE contract (§1).
+    # IDENTICAL logic to /pad/check (app/main.py ~744-752) to prevent divergence.
+    # This is an ADDITIVE field — existing consumers reading only
+    # elapsed_time/is_spoof are unaffected (same values as before).
+    label = result.get("label", "unknown")
+    score = result.get("score", 0.0)
+
+    # Explicit three-branch verdict mapping (NOT via is_real boolean).
+    # This prevents the regression where label="real" + score<threshold → spoof.
+    if label == "document_photo":
+        verdict = "spoof"
+        reason: Optional[str] = "DOCUMENT_PHOTO"
+    elif label == "no_face":
+        verdict = "low_quality"
+        reason = "NO_FACE"
+    elif label == "spoof":
+        verdict = "spoof"
+        reason = "PASSIVE_PAD_SPOOF"
+    elif score < settings.LIVENESS_THRESHOLD:
+        # Real face but low score (bad lighting, occlusion, etc.) → low quality
+        verdict = "low_quality"
+        reason = "LOW_QUALITY"
+    else:
+        # label="real" and score >= threshold → live
+        verdict = "live"
+        reason = None
+
+    return SpoofServerResponse(
+        elapsed_time=elapsed,
+        is_spoof=is_spoof,
+        verdict=verdict,
+        reason=reason,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -765,3 +901,408 @@ async def pad_check(
         model_version=MODEL_VERSION,
         processing_ms=processing_ms,
     )
+
+
+# ---------------------------------------------------------------------------
+# POST /liveness/challenge + POST /liveness/verdict — active liveness
+# (Phase 2, FACEID_ANTIBYPASS_UNIFIED_PLAN_v1.md §1.2 / FACEID_LIVENESS_ML_CORE_v1.md)
+#
+# Internal ML-perimeter endpoints — Laravel calls these when it handles the
+# PUBLIC POST /liveness/start / POST /liveness/verify, same pattern already
+# used for /pad/check (127.0.0.1-only, X-Service-Token, not client-facing).
+# Does NOT touch /verify, /verify_batch, /spoof-server, /pad/check.
+# ---------------------------------------------------------------------------
+
+LIVENESS_MODEL_VERSION = (
+    f"{MODEL_VERSION}"
+    "+scrfd-buffalo_l-det+landmark_3d_68"
+    "+adaface-ir101-webface12m-onnx"
+    "+active_challenge-turn_only_v1"
+)
+
+
+class LivenessChallengeRequest(BaseModel):
+    """`transaction_type` is passthrough ONLY here — unlike PadCheckRequest's
+    Literal["sale"], this service does not validate it (per explicit
+    instruction: identity/transaction semantics are Laravel's domain)."""
+    correlation_id: str = Field(
+        ..., description="UUID minted by Laravel in POST /liveness/start, echoed unchanged through "
+        "/liveness/challenge -> /liveness/verdict. This is the R2 SESSION-BINDING key (see "
+        "LivenessVerdictRequest.correlation_id) as well as a log-tracing id.",
+    )
+    transaction_type: str = Field(..., description="Passthrough, not validated by this service")
+    transaction_ref: str = Field(
+        ..., description="Natural key, e.g. id_request:id_ballon — PASSTHROUGH ONLY for /liveness/*. "
+        "May legitimately not be final at challenge time; NOT used for session binding (correlation_id is).",
+    )
+
+
+class ChallengeSpec(BaseModel):
+    steps: list[str] = Field(..., description="Randomized subset+order, e.g. ['TURN_RIGHT','TURN_LEFT']")
+    min_frames: int
+    max_frames: int
+
+
+class LivenessChallengeResponse(BaseModel):
+    session_id: str
+    challenge_spec: ChallengeSpec
+    t_instruction_shown: float = Field(..., description="Unix timestamp, echoed back for window-timing checks")
+    expires_at: float = Field(..., description="Unix timestamp — session_id invalid after this")
+    model_version: str
+
+
+class LivenessFrame(BaseModel):
+    seq: int = Field(..., ge=0)
+    base64: str
+    captured_at: Optional[str] = None
+
+
+class LivenessVerdictRequest(BaseModel):
+    correlation_id: str = Field(
+        ..., description="Must match the correlation_id the session_id was minted under — the R2 "
+        "binding check (see app/main.py::_run_liveness_verdict) compares THIS, not transaction_ref.",
+    )
+    session_id: str
+    transaction_type: str = Field(..., description="Passthrough, not validated by this service")
+    transaction_ref: str = Field(..., description="Passthrough only — not part of the R2 binding check.")
+    frames: list[LivenessFrame]
+
+
+class LivenessVerdictResponse(BaseModel):
+    """`reason` is the DETAILED internal cause — per contract this response
+    is consumed by Laravel only, never relayed verbatim to the end client
+    (Laravel must map it to a generic client-facing message/code so an
+    attacker cannot calibrate an evasion attempt against per-signal
+    feedback)."""
+    verdict: Literal["live", "spoof", "incomplete", "low_quality"]
+    reason: Optional[str] = None
+    model_version: str
+    frame_consistency_score: float = Field(
+        ..., description="Layer 3 min pairwise cosine similarity across key frames; -1.0 if not computed"
+    )
+    best_frame_seq: Optional[int] = Field(
+        None,
+        description="seq of the frame Laravel should forward downstream (e.g. to Adliya) — "
+        "ALWAYS one of the frames in the request, never re-sampled. Only set when verdict=live.",
+    )
+    session_id: Optional[str] = None
+    correlation_id: Optional[str] = None
+    transaction_type: Optional[str] = None
+    transaction_ref: Optional[str] = None
+    processing_ms: float
+    signals: dict = Field(default_factory=dict, description="Internal-only layer breakdown, not for client display")
+
+
+def _liveness_audit_entry(
+    correlation_id: Optional[str], session_id: Optional[str], transaction_type: Optional[str],
+    transaction_ref: Optional[str], verdict: str, reason: Optional[str],
+    frame_consistency_score: float, processing_ms: float, n_frames_received: int, n_frames_valid: int,
+) -> None:
+    """Metadata-only audit entry — NEVER the frame bytes themselves, same
+    privacy posture as _audit_entry() for /pad/check."""
+    entry = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "endpoint": "liveness_verdict",
+        "correlation_id": correlation_id,
+        "session_id": session_id,
+        "transaction_type": transaction_type,
+        "transaction_ref": transaction_ref,
+        "verdict": verdict,
+        "reason": reason,
+        "frame_consistency_score": frame_consistency_score,
+        "n_frames_received": n_frames_received,
+        "n_frames_valid": n_frames_valid,
+        "model_version": LIVENESS_MODEL_VERSION,
+        "processing_ms": round(processing_ms, 1),
+    }
+    audit_log.info(json.dumps(entry, ensure_ascii=False))
+
+
+def _liveness_not_ready_response() -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Active-liveness endpoints are disabled or models failed to load"},
+    )
+
+
+@app.post("/liveness/challenge", response_model=LivenessChallengeResponse)
+async def liveness_challenge(
+    req: LivenessChallengeRequest,
+    x_service_token: Optional[str] = Header(None, alias="X-Service-Token"),
+):
+    """Generates a randomized challenge_spec and mints session_id. Laravel
+    relays session_id + challenge_spec to the client unchanged when it
+    handles the public POST /liveness/start. THIS service is the sole
+    source of truth for what challenge_spec a given session_id means —
+    POST /liveness/verdict looks it up by session_id, it does not trust a
+    client- or Laravel-supplied spec."""
+    _verify_service_token(x_service_token)
+
+    if not settings.LIVENESS_ENDPOINTS_ENABLED or not _liveness_models_loaded:
+        return _liveness_not_ready_response()
+
+    pool = [s.strip() for s in settings.LIVENESS_CHALLENGE_STEPS_POOL.split(",") if s.strip()]
+    steps = generate_challenge_spec(pool, settings.LIVENESS_CHALLENGE_STEP_COUNT)
+
+    session = session_store.create(
+        steps=steps,
+        ttl_s=settings.LIVENESS_SESSION_TTL_S,
+        correlation_id=req.correlation_id,
+        transaction_type=req.transaction_type,
+        transaction_ref=req.transaction_ref,
+    )
+
+    log.info(
+        "liveness_challenge: correlation=%s session=%s steps=%s txn=%s",
+        req.correlation_id, session.session_id, steps, req.transaction_ref,
+    )
+
+    return LivenessChallengeResponse(
+        session_id=session.session_id,
+        challenge_spec=ChallengeSpec(
+            steps=steps,
+            min_frames=settings.LIVENESS_MIN_FRAMES,
+            max_frames=settings.LIVENESS_MAX_FRAMES,
+        ),
+        t_instruction_shown=session.t_instruction_shown,
+        expires_at=session.expires_at,
+        model_version=LIVENESS_MODEL_VERSION,
+    )
+
+
+def _run_liveness_verdict(req: LivenessVerdictRequest) -> LivenessVerdictResponse:
+    """Synchronous body of POST /liveness/verdict — run via asyncio.wait_for
+    with LIVENESS_INFERENCE_TIMEOUT_S from the route handler below."""
+    t0 = time.perf_counter()
+
+    def _respond(verdict: str, reason: Optional[str], *, frame_consistency_score: float = -1.0,
+                 best_frame_seq: Optional[int] = None, signals: Optional[dict] = None) -> LivenessVerdictResponse:
+        ms = round((time.perf_counter() - t0) * 1000, 1)
+        out_signals = dict(signals or {})
+        n_valid = out_signals.pop("_n_valid", 0)  # audit-only counter, not part of the outward signals shape
+        _liveness_audit_entry(
+            req.correlation_id, req.session_id, req.transaction_type, req.transaction_ref,
+            verdict, reason, frame_consistency_score, ms,
+            n_frames_received=len(req.frames), n_frames_valid=n_valid,
+        )
+        return LivenessVerdictResponse(
+            verdict=verdict, reason=reason, model_version=LIVENESS_MODEL_VERSION,
+            frame_consistency_score=frame_consistency_score, best_frame_seq=best_frame_seq,
+            session_id=req.session_id, correlation_id=req.correlation_id,
+            transaction_type=req.transaction_type, transaction_ref=req.transaction_ref,
+            processing_ms=ms, signals=out_signals,
+        )
+
+    # --- session lookup (R2: challenge_spec is ALWAYS the one this service
+    # generated for this session_id, never client/Laravel-supplied) ---
+    session, err = session_store.consume(req.session_id)
+    if err is not None:
+        return _respond("incomplete", err)
+
+    # --- R2 binding check: the frames graded here must belong to the SAME
+    # /liveness/start session the challenge was issued for. Per backend
+    # confirmation (agent-mesh 2026-07-17, umid-agent msg 1784265688632-0):
+    # `correlation_id` is minted by Laravel in POST /liveness/start and
+    # echoed unchanged through /liveness/challenge -> /liveness/verdict —
+    # THAT is the binding key, not `transaction_ref`. `transaction_ref`
+    # (the id_request:id_ballon natural sale key) can legitimately not be
+    # final yet when the challenge is issued (a sale reference can be
+    # assigned/confirmed after the liveness check runs) and is kept on the
+    # request purely as passthrough for audit/logging, same as
+    # `transaction_type` — it is intentionally NOT compared here anymore.
+    # Soft in this increment — logged and rejected, but not yet proven
+    # against a real Laravel integration test, see final report.
+    if session.correlation_id != req.correlation_id:
+        return _respond(
+            "incomplete", "SESSION_CORRELATION_MISMATCH",
+            signals={"session_correlation_id": session.correlation_id, "request_correlation_id": req.correlation_id},
+        )
+
+    # --- per-frame decode + Layer 0 QC + Layer 0a geometry gate ---
+    from app.face_landmarks import LandmarkDetector  # local import, models already loaded at startup
+
+    per_frame_signals: dict = {}
+    valid_frames: list[tuple[int, np.ndarray, "FrameFace", np.ndarray]] = []
+    geometry_hits: dict = {}
+    for frame in sorted(req.frames, key=lambda f: f.seq):
+        try:
+            img_bytes = base64.b64decode(frame.base64)
+            _validate_image_size(img_bytes)
+            img = _read_image(img_bytes)
+            _validate_image_dimensions(img)
+        except HTTPException:
+            per_frame_signals[frame.seq] = {"valid": False, "reason": "DECODE_ERROR"}
+            continue
+
+        face = landmark_detector.analyze(img)
+        aligned = LandmarkDetector.align_112(img, face.kps) if face is not None else None
+        qc = assess_frame(img, face, aligned_112=aligned)
+        frame_signal = {"valid": qc.valid, "reason": qc.reason, "metrics": qc.metrics}
+
+        # Layer 0a — SAME deterministic face-to-frame geometry gate already
+        # used by /pad/check and friends (app/geometry_check.py), reused
+        # here unmodified via the shared _run_geometry_gate/_geometry_signals
+        # helpers — no new logic, no new calibration. Runs on the RAW frame
+        # (not the QC-gated crop) because a document/passport photo held up
+        # to the camera is often sharp/well-lit enough to otherwise pass
+        # Layer 0 QC cleanly; this must not depend on a frame first being
+        # judged "valid" by frame_qc. `face.bbox_xyxy` is SCRFD's box
+        # (x1,y1,x2,y2) — converted to the [x,y,w,h] shape
+        # check_face_geometry() expects (same shape FaceDetector.detect()
+        # returns for the RetinaFace-based endpoints).
+        if face is not None:
+            x1, y1, x2, y2 = face.bbox_xyxy
+            bbox_xywh = [int(x1), int(y1), int(x2 - x1), int(y2 - y1)]
+            geo_result = _run_geometry_gate(bbox_xywh, img)
+            if geo_result is not None:
+                frame_signal["geometry_check"] = _geometry_signals(geo_result)["geometry_check"]
+                geometry_hits[frame.seq] = geo_result
+
+        per_frame_signals[frame.seq] = frame_signal
+        if qc.valid:
+            valid_frames.append((frame.seq, img, face, aligned))
+
+    # Any frame flagged as a document/ID photo fails the WHOLE session,
+    # same priority as /pad/check (before passive-PAD, before the
+    # MIN_FRAMES completeness check — a sharp, well-lit document photo can
+    # otherwise sail through Layer 0 QC and would wrongly read as
+    # "incomplete" instead of "spoof" if checked after the MIN_FRAMES gate).
+    if geometry_hits:
+        base_signals = {"layer0_frame_qc": per_frame_signals, "_n_valid": len(valid_frames)}
+        base_signals["layer0a_geometry_check"] = {
+            str(seq): _geometry_signals(geo)["geometry_check"] for seq, geo in geometry_hits.items()
+        }
+        # frame_consistency_score stays -1.0 (its documented "not computed"
+        # value) — Layer 3 never ran, and that field is specifically Layer
+        # 3's cosine similarity, not a generic score slot; the geometry
+        # ratio lives in signals.layer0a_geometry_check instead.
+        return _respond("spoof", "DOCUMENT_PHOTO", signals=base_signals)
+
+    n_valid = len(valid_frames)
+    base_signals = {"layer0_frame_qc": per_frame_signals, "_n_valid": n_valid}
+
+    if n_valid < settings.LIVENESS_MIN_FRAMES:
+        return _respond("incomplete", "LOW_QUALITY_FRAMES", signals=base_signals)
+
+    # --- Layer 2: active challenge (OBLIGATORY gate — runs BEFORE Layer 3/1,
+    # per FACEID_LIVENESS_ML_CORE_v1.md §3: a good passive/identity score
+    # must never compensate for a failed active challenge) ---
+    active_result = verify_challenge(
+        session.steps, [(seq, face) for seq, _, face, _ in valid_frames], settings,
+    )
+    base_signals["layer2_active_challenge"] = {
+        "passed": active_result.passed, "reason": active_result.reason, "detail": active_result.detail,
+        "requested_steps": session.steps,
+    }
+    if not active_result.passed:
+        if active_result.reason == "UNSUPPORTED_STEP":
+            return _respond("incomplete", "ACTIVE_CHALLENGE_NOT_IMPLEMENTED", signals=base_signals)
+        if active_result.reason == "NO_FRONTAL_REFERENCE":
+            return _respond("incomplete", "NO_FRONTAL_REFERENCE", signals=base_signals)
+        return _respond("spoof", "CHALLENGE_FAILED", signals=base_signals)
+
+    # --- Layer 3: cross-frame identity consistency (PRIORITY #1 of this
+    # increment — see app/identity_consistency.py) ---
+    identity_result = compute_identity_consistency(
+        adaface_embedder, [(seq, aligned) for seq, _, _, aligned in valid_frames], settings.IDENTITY_MIN,
+    )
+    base_signals["layer3_identity_consistency"] = {
+        "passed": identity_result.passed, "min_similarity": identity_result.min_similarity,
+        "reference_seq": identity_result.reference_seq, "pairwise": identity_result.pairwise,
+        "threshold": settings.IDENTITY_MIN,
+    }
+    if not identity_result.passed:
+        return _respond(
+            "spoof", "IDENTITY_SWAP_MID_SESSION",
+            frame_consistency_score=identity_result.min_similarity, signals=base_signals,
+        )
+
+    # --- Layer 1: passive PAD, REUSED unmodified (defense-in-depth) ---
+    # Simplification vs FACEID_LIVENESS_ML_CORE_v1.md §2.1's "75th
+    # percentile of combined_score" recommendation: that recommendation
+    # itself is flagged there as an unconfirmed working hypothesis, AND
+    # combined_score's numeric meaning is label-conditional in the current
+    # `_fuse()` implementation (real-confidence vs spoof-confidence are not
+    # on a shared scale), so a naive percentile over raw scores would not
+    # mean what the recommendation intends without deeper rework. This
+    # increment uses "any valid key frame labeled spoof by the existing
+    # engine.predict() -> aggregate spoof" instead — MORE conservative
+    # (biases toward rejecting live traffic, i.e. higher BPCER not higher
+    # APCER), consistent with "не занижай FAR". Revisit once real
+    # multi-frame session data exists to calibrate the intended aggregation.
+    layer1_frames = []
+    passive_spoof = False
+    for seq, img, _, _ in valid_frames:
+        bbox = detector.detect(img)  # RetinaFace bbox, [x,y,w,h] — SEPARATE detector from Layer 0/2/3's SCRFD
+        if bbox is None:
+            layer1_frames.append({"seq": seq, "label": "no_face"})
+            continue
+        label, score, _, _sig = engine.predict(img, bbox)
+        layer1_frames.append({"seq": seq, "label": label, "score": round(score, 4)})
+        if label == "spoof":
+            passive_spoof = True
+    base_signals["layer1_passive_pad"] = {"frames": layer1_frames, "aggregate": "any_frame_spoof"}
+
+    if passive_spoof:
+        return _respond(
+            "spoof", "PASSIVE_PAD_SPOOF",
+            frame_consistency_score=identity_result.min_similarity, signals=base_signals,
+        )
+
+    # --- live: pick best_frame_seq from the SAME valid_frames set (R2 — no
+    # re-sampling). Prefer frontal + sharpest among valid frames. ---
+    def _quality_key(item):
+        seq, _, face, _ = item
+        frontal_bonus = 1.0 if abs(face.pose_yaw) <= settings.LIVENESS_YAW_FRONTAL_MAX_DEG else 0.0
+        sharp = per_frame_signals.get(seq, {}).get("metrics", {}).get("sharpness", 0.0)
+        return (frontal_bonus, sharp)
+
+    best_seq = max(valid_frames, key=_quality_key)[0]
+
+    return _respond(
+        "live", None, frame_consistency_score=identity_result.min_similarity,
+        best_frame_seq=best_seq, signals=base_signals,
+    )
+
+
+@app.post("/liveness/verdict", response_model=LivenessVerdictResponse)
+async def liveness_verdict(
+    req: LivenessVerdictRequest,
+    x_service_token: Optional[str] = Header(None, alias="X-Service-Token"),
+):
+    _verify_service_token(x_service_token)
+
+    if not settings.LIVENESS_ENDPOINTS_ENABLED or not _liveness_models_loaded:
+        return _liveness_not_ready_response()
+
+    if not req.frames or len(req.frames) > settings.LIVENESS_MAX_FRAMES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"frames must be 1..{settings.LIVENESS_MAX_FRAMES}, got {len(req.frames)}",
+        )
+    seqs = [f.seq for f in req.frames]
+    if len(seqs) != len(set(seqs)):
+        raise HTTPException(status_code=422, detail="duplicate frame seq values")
+
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_run_liveness_verdict, req),
+            timeout=settings.LIVENESS_INFERENCE_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        log.error(
+            "liveness_verdict: inference timeout after %.1fs correlation=%s session=%s",
+            settings.LIVENESS_INFERENCE_TIMEOUT_S, req.correlation_id, req.session_id,
+        )
+        _liveness_audit_entry(
+            req.correlation_id, req.session_id, req.transaction_type, req.transaction_ref,
+            "incomplete", "TIMEOUT", -1.0, settings.LIVENESS_INFERENCE_TIMEOUT_S * 1000,
+            n_frames_received=len(req.frames), n_frames_valid=0,
+        )
+        return LivenessVerdictResponse(
+            verdict="incomplete", reason="TIMEOUT", model_version=LIVENESS_MODEL_VERSION,
+            frame_consistency_score=-1.0, best_frame_seq=None,
+            session_id=req.session_id, correlation_id=req.correlation_id,
+            transaction_type=req.transaction_type, transaction_ref=req.transaction_ref,
+            processing_ms=round(settings.LIVENESS_INFERENCE_TIMEOUT_S * 1000, 1), signals={},
+        )
