@@ -12,4 +12,52 @@ torch>=2.1.0
 # /verify, /verify_batch, /spoof-server, /pad/check do not depend on these and keep
 # working on a deploy that has not installed them yet.
 insightface>=0.7.3   # SCRFD detection + landmark_3d_68 pose (buffalo_l), Layer 0/2/3
-onnxruntime>=1.16.0  # AdaFace IR-101 ONNX inference (Layer 3 cross-frame identity)
+onnxruntime>=1.16.0  # AdaFace IR-101 + SCRFD/landmark_3d_68 ONNX inference, CPU. MANDATORY —
+                     # this is what egaz-02.uz prod actually runs on today (CPU-only host).
+                     # Do NOT remove even on a GPU box: app/config.py::onnx_providers()
+                     # gracefully falls back to this if onnxruntime-gpu below is absent or
+                     # its CUDA/cuDNN runtime is missing — the service must keep working
+                     # CPU-only either way.
+
+# --- OPTIONAL: GPU mode for the Active-liveness identity layer (RZA, 2026-07-17) ---
+# NOT required for any deploy. app/adaface.py (AdaFaceEmbedder) and
+# app/face_landmarks.py (LandmarkDetector, SCRFD+landmark_3d_68) both read the SAME
+# DEVICE=auto|cpu|cuda env var app/liveness.py's LivenessEngine already uses
+# (app/config.py::resolve_device / onnx_providers) and pick CPU vs CUDA providers
+# accordingly — this line only matters if DEVICE=cuda (or auto with a CUDA-capable
+# torch on the box) AND you want the ONNX/insightface models to actually run on GPU
+# too, not just the torch-based MiniFASNet passive-PAD models.
+#
+# Measured on this repo's dev box (RTX 3080, onnxruntime-gpu 1.20.1, driver
+# 580.159.03): AdaFace IR-101 embedding drops from ~250ms/frame (CPU, this same
+# 12-thread box; 342-524ms/frame on prod's i5-11400) to ~4ms/frame warm on CUDA;
+# SCRFD+landmark_3d_68 drops from ~34ms/frame (CPU) to ~6ms/frame. See
+# scripts/bench_identity_layer.py for the reproducible benchmark and
+# docs/plans/ (owner report) for the full CPU-vs-GPU writeup.
+#
+# Install steps for a GPU box (leave commented out / do NOT add to a CPU deploy's
+# venv — onnxruntime and onnxruntime-gpu both install as the SAME top-level
+# `onnxruntime` Python package and WILL conflict if both are present):
+#   1. pip uninstall onnxruntime            # remove the CPU wheel first
+#   2. pip install onnxruntime-gpu==1.20.1  # NOT the newest (1.27.x) release —
+#      1.27.0 links against CUDA 13 (libcudart.so.13), which this box's CUDA 12.1
+#      pip runtime (torch's nvidia-*-cu12 wheels) does not provide; 1.20.1 matches
+#      CUDA 12.x / cuDNN 9.x, i.e. the SAME runtime torch>=2.1.0 already installs —
+#      no separate system CUDA toolkit install needed.
+#   3. Set DEVICE=cuda (or auto) AND point LD_LIBRARY_PATH at the pip-installed
+#      CUDA/cuDNN libs so onnxruntime's CUDAExecutionProvider can dlopen them
+#      (torch does this automatically via wheel RPATH; onnxruntime-gpu does not):
+#        SITE=$(python3 -c "import site; print(site.getsitepackages()[0])")
+#        export LD_LIBRARY_PATH="$SITE/nvidia/cublas/lib:$SITE/nvidia/cudnn/lib:\
+#        $SITE/nvidia/cuda_runtime/lib:$SITE/nvidia/cuda_nvrtc/lib:$SITE/nvidia/cufft/lib:\
+#        $SITE/nvidia/curand/lib:$SITE/nvidia/cusparse/lib:$SITE/nvidia/cusolver/lib:\
+#        $SITE/nvidia/nccl/lib:$SITE/nvidia/nvjitlink/lib:${LD_LIBRARY_PATH:-}"
+#      (add this export to deploy.sh / the systemd unit's Environment= lines for a
+#      persistent GPU deploy — NOT done automatically, this repo's deploy.sh
+#      defaults DEVICE=cpu and stays CPU-only unless explicitly overridden).
+#   4. Without step 3's LD_LIBRARY_PATH, CUDAExecutionProvider fails to dlopen and
+#      onnxruntime silently falls back to CPUExecutionProvider on its own (verified
+#      on this dev box) — app/config.py::onnx_providers()'s own fallback then never
+#      even triggers, so a misconfigured GPU box degrades to slow-but-correct CPU
+#      inference rather than crashing, at either layer.
+# onnxruntime-gpu==1.20.1  # uncomment on a provisioned GPU box only, see steps above

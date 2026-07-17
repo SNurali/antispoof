@@ -104,6 +104,21 @@ docker run --gpus all -p 8090:8090 -e DEVICE=cuda antispoof:gpu
 
 Требует установленный `nvidia-container-toolkit` на хосте.
 
+**Два независимых слоя честно проверяют DEVICE (2026-07-17):** MiniFASNet passive-PAD
+(`app/liveness.py`, torch) — уже умел `DEVICE=cuda/cpu/auto` — и identity-слой
+Layer 0/2/3 активного liveness (`app/adaface.py` AdaFace IR-101 + `app/face_landmarks.py`
+SCRFD/landmark_3d_68, оба onnxruntime/insightface) — теперь тоже читает тот же DEVICE
+(`app/config.py::onnx_providers`). ВАЖНО: `Dockerfile.gpu` выше ставит только
+`torch ... --index-url .../cu121` + обычный `requirements.txt` (CPU-wheel
+`onnxruntime`) — значит identity-слой в этом образе останется на CPU, даже с
+`DEVICE=cuda` (мягкий fallback, не падает, но и GPU не использует). Чтобы ускорить
+и его — см. `requirements.txt`, секцию "OPTIONAL: GPU mode for the Active-liveness
+identity layer": нужен `onnxruntime-gpu==1.20.1` вместо `onnxruntime`, cuDNN 9 в
+образе (например базовый образ `nvidia/cuda:12.1.1-cudnn9-runtime-ubuntu22.04` вместо
+текущего `...-runtime-...` без cuDNN) и `LD_LIBRARY_PATH` до нужных `.so`. На прод
+(egaz-02.uz, CPU-only) это не влияет — там `DEVICE=cpu` жёстко в `deploy.sh`, ONNX
+identity-слой и так CPU-only и остаётся CPU-only.
+
 ## 4. Сертификаты — почему self-signed и как заменить
 
 `certs/` **не хранится в git** (см. `.gitignore`) — приватный ключ `key.pem` генерируется

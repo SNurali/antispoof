@@ -38,12 +38,37 @@ class AdaFaceEmbedder:
 
     INPUT_SIZE = 112
 
-    def __init__(self, onnx_path: Path, intra_op_num_threads: int = 0) -> None:
+    def __init__(
+        self, onnx_path: Path, device: str = "cpu", intra_op_num_threads: int = 0
+    ) -> None:
+        """`device` is a RESOLVED device string ("cpu"/"cuda", see
+        app/config.py::resolve_device) — same DEVICE knob app/liveness.py's
+        LivenessEngine already takes, now wired through here too (2026-07-17
+        GPU dual-mode work). Measured on this repo's dev RTX 3080
+        (onnxruntime-gpu 1.20.1, CUDA 12.1/cuDNN 9.1 via the same pip
+        nvidia-*-cu12 wheels torch already depends on): ~4ms/frame warm on
+        CUDAExecutionProvider vs ~250ms/frame CPUExecutionProvider on this
+        same 12-thread dev box, and 342-524ms/frame on the i5-11400 prod-like
+        box this file's module docstring cites for CPU. See
+        scripts/bench_identity_layer.py for the reproducible benchmark.
+
+        Falls back to CPU-only in two independent ways, neither of which
+        requires onnxruntime-gpu to be installed or raises if it is not:
+        (1) app.config.onnx_providers() only returns a CUDA provider if
+        onnxruntime itself reports "CUDAExecutionProvider" in
+        get_available_providers() (i.e. onnxruntime-gpu is actually the
+        package installed); (2) even if that check passes, session creation
+        below is wrapped in try/except — a CUDA/cuDNN runtime version
+        mismatch on the box (not knowable without actually trying to init)
+        also falls back to CPU-only rather than crashing.
+        """
         # Imported lazily so a deploy with LIVENESS_ENDPOINTS_ENABLED=False
         # (app/config.py) never needs onnxruntime installed at all — this
         # module is otherwise imported unconditionally by app/main.py via
         # app/identity_consistency.py.
         import onnxruntime as ort
+
+        from app.config import onnx_providers
 
         if not Path(onnx_path).exists():
             raise FileNotFoundError(
@@ -55,11 +80,32 @@ class AdaFaceEmbedder:
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         if intra_op_num_threads > 0:
             so.intra_op_num_threads = intra_op_num_threads
-        self._session = ort.InferenceSession(
-            str(onnx_path), so, providers=["CPUExecutionProvider"]
-        )
+
+        providers = onnx_providers(device)
+        try:
+            self._session = ort.InferenceSession(str(onnx_path), so, providers=providers)
+        except Exception:
+            if providers != ["CPUExecutionProvider"]:
+                logger.exception(
+                    "AdaFace ONNX session failed to init with providers=%s "
+                    "(requested device=%s) — falling back to CPUExecutionProvider "
+                    "only. Common cause: onnxruntime-gpu is installed but the "
+                    "CUDA/cuDNN runtime it needs is missing or a version "
+                    "mismatch (see requirements.txt GPU section).",
+                    providers, device,
+                )
+                self._session = ort.InferenceSession(
+                    str(onnx_path), so, providers=["CPUExecutionProvider"]
+                )
+            else:
+                raise
+
         self._input_name = self._session.get_inputs()[0].name
-        logger.info("AdaFace IR-101 ONNX loaded from %s (CPUExecutionProvider)", onnx_path)
+        active_providers = self._session.get_providers()
+        logger.info(
+            "AdaFace IR-101 ONNX loaded from %s (requested device=%s, active providers=%s)",
+            onnx_path, device, active_providers,
+        )
 
     def embed_aligned(self, aligned_bgr_112: np.ndarray) -> np.ndarray:
         """aligned_bgr_112: 112x112x3 BGR crop, ALREADY landmark-aligned

@@ -341,8 +341,8 @@ def _load_liveness_models() -> None:
         from app.adaface import AdaFaceEmbedder
         from app.face_landmarks import LandmarkDetector
 
-        landmark_detector = LandmarkDetector(det_size=settings.LIVENESS_DET_SIZE)
-        adaface_embedder = AdaFaceEmbedder(settings.ADAFACE_ONNX_PATH)
+        landmark_detector = LandmarkDetector(det_size=settings.LIVENESS_DET_SIZE, device=DEVICE)
+        adaface_embedder = AdaFaceEmbedder(settings.ADAFACE_ONNX_PATH, device=DEVICE)
         _liveness_models_loaded = True
         log.info("Active-liveness models loaded (Layer 0/2/3 ready).")
     except Exception:

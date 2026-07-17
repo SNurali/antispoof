@@ -118,20 +118,78 @@ def min_eye_aspect_ratio(landmark_68: np.ndarray) -> float:
 class LandmarkDetector:
     """Loads buffalo_l detection+landmark_3d_68 once; analyzes frames on demand."""
 
-    def __init__(self, det_size: int = 320) -> None:
+    def __init__(self, det_size: int = 320, device: str = "cpu") -> None:
+        """`device` is a RESOLVED device string ("cpu"/"cuda", see
+        app/config.py::resolve_device) — same DEVICE knob app/liveness.py's
+        LivenessEngine and app/adaface.py::AdaFaceEmbedder already take
+        (2026-07-17 GPU dual-mode work). Measured on this repo's dev RTX
+        3080: SCRFD det_10g + landmark_3d_68 combined ~6ms/frame warm on
+        CUDAExecutionProvider vs ~34ms/frame CPUExecutionProvider on this
+        same 12-thread dev box (see module docstring for the ~100-160ms/frame
+        figure on the i5-11400 prod-like box). See
+        scripts/bench_identity_layer.py for the reproducible benchmark.
+
+        insightface's own `FaceAnalysis.prepare(ctx_id, ...)` FORCES
+        CPUExecutionProvider internally whenever ctx_id<0 (see
+        insightface.model_zoo.scrfd.SCRFD.prepare /
+        insightface.model_zoo.landmark.Landmark.prepare — both call
+        `self.session.set_providers(['CPUExecutionProvider'])` when
+        ctx_id<0, silently overriding whatever `providers=` was passed at
+        construction). So `ctx_id` and `providers` must agree here — ctx_id
+        is derived FROM the resolved provider list, not hardcoded.
+
+        Falls back to CPU-only in two independent ways, same pattern as
+        AdaFaceEmbedder: (1) app.config.onnx_providers() only returns a CUDA
+        provider if onnxruntime itself reports "CUDAExecutionProvider" in
+        get_available_providers(); (2) session/model construction below is
+        wrapped in try/except — a CUDA/cuDNN runtime mismatch also falls
+        back to CPU-only rather than crashing.
+        """
         # Imported lazily inside __init__, not at module top, so that a
         # deploy with LIVENESS_ENDPOINTS_ENABLED=False never needs
         # insightface installed at all (app/main.py only constructs this
         # class when the flag is on).
         from insightface.app import FaceAnalysis
 
-        self._app = FaceAnalysis(
-            name="buffalo_l",
-            allowed_modules=["detection", "landmark_3d_68"],
-            providers=["CPUExecutionProvider"],
+        from app.config import onnx_providers
+
+        providers = onnx_providers(device)
+        ctx_id = 0 if providers[0] == "CUDAExecutionProvider" else -1
+
+        try:
+            self._app = FaceAnalysis(
+                name="buffalo_l",
+                allowed_modules=["detection", "landmark_3d_68"],
+                providers=providers,
+            )
+            self._app.prepare(ctx_id=ctx_id, det_size=(det_size, det_size))
+        except Exception:
+            if providers != ["CPUExecutionProvider"]:
+                logger.exception(
+                    "SCRFD/landmark_3d_68 failed to init with providers=%s "
+                    "(requested device=%s, ctx_id=%d) — falling back to "
+                    "CPUExecutionProvider only. Common cause: onnxruntime-gpu "
+                    "is installed but the CUDA/cuDNN runtime it needs is "
+                    "missing or a version mismatch (see requirements.txt GPU "
+                    "section).",
+                    providers, device, ctx_id,
+                )
+                providers = ["CPUExecutionProvider"]
+                ctx_id = -1
+                self._app = FaceAnalysis(
+                    name="buffalo_l",
+                    allowed_modules=["detection", "landmark_3d_68"],
+                    providers=providers,
+                )
+                self._app.prepare(ctx_id=ctx_id, det_size=(det_size, det_size))
+            else:
+                raise
+
+        logger.info(
+            "LandmarkDetector ready (buffalo_l detection+landmark_3d_68, det_size=%d, "
+            "requested device=%s, providers=%s, ctx_id=%d)",
+            det_size, device, providers, ctx_id,
         )
-        self._app.prepare(ctx_id=-1, det_size=(det_size, det_size))
-        logger.info("LandmarkDetector ready (buffalo_l detection+landmark_3d_68, det_size=%d)", det_size)
 
     def analyze(self, image_bgr: np.ndarray) -> Optional[FrameFace]:
         """Returns the highest-det_score face's analysis, or None if no face

@@ -1,9 +1,12 @@
 """Pydantic settings loaded from environment variables."""
 
+import logging
 from pathlib import Path
 from typing import Annotated
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, NoDecode
+
+log = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
@@ -279,3 +282,41 @@ def resolve_device(requested: str) -> str:
     if requested == "auto":
         return "cuda" if torch.cuda.is_available() else "cpu"
     return requested
+
+
+def onnx_providers(device: str) -> list[str]:
+    """Map a RESOLVED device string ("cuda"/"cpu", i.e. already passed through
+    resolve_device() above) to an onnxruntime provider list — the same
+    auto|cpu|cuda knob app/liveness.py's torch-based LivenessEngine already
+    gets, extended to this service's onnxruntime/insightface consumers
+    (app/adaface.py::AdaFaceEmbedder, app/face_landmarks.py::LandmarkDetector
+    — Layer 0/2/3 of the active-liveness pipeline; see
+    Settings.ADAFACE_ONNX_PATH docstring for the measured CPU latency
+    (342-524ms/frame) this exists to cut down).
+
+    CRITICAL (prod is CPU-only today, egaz-02.uz has no GPU): this is
+    deliberately conservative and NEVER assumes a GPU-capable onnxruntime is
+    actually installed just because device=="cuda" was requested. It always
+    checks onnxruntime's OWN ort.get_available_providers() first —
+    requirements.txt keeps `onnxruntime-gpu` an OPTIONAL install (the base
+    `onnxruntime` CPU wheel stays mandatory); on a host that only has the CPU
+    wheel, "CUDAExecutionProvider" simply is not in that list and this
+    silently returns CPU-only, no exception, no GPU package required. The
+    caller (AdaFaceEmbedder / LandmarkDetector) additionally wraps session
+    creation in a try/except and retries CPU-only if a CUDA provider that
+    LOOKED available still fails to actually initialize (e.g. cuDNN/CUDA
+    runtime version mismatch) — this function only handles the "package not
+    installed at all" case, not every possible runtime failure.
+    """
+    if device != "cuda":
+        return ["CPUExecutionProvider"]
+    try:
+        import onnxruntime as ort
+
+        available = ort.get_available_providers()
+    except Exception:
+        log.debug("onnxruntime provider check failed, falling back to CPU", exc_info=True)
+        return ["CPUExecutionProvider"]
+    if "CUDAExecutionProvider" in available:
+        return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    return ["CPUExecutionProvider"]
