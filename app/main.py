@@ -17,6 +17,7 @@ import hmac
 import json
 import logging
 import logging.handlers
+import math
 import os
 import time
 import uuid
@@ -839,6 +840,46 @@ def _verify_service_token(x_service_token: Optional[str]) -> None:
         raise HTTPException(status_code=401, detail="Invalid or missing X-Service-Token")
 
 
+def _verify_replay_protection(x_request_timestamp: Optional[str]) -> None:
+    """Anti-replay guard — bounded timestamp window layered ON TOP OF mTLS
+    (deploy/mtls/, BUSTA RHYMES) + the existing X-Service-Token/IP-allowlist
+    (both unchanged by this). mTLS authenticates the channel ("who is
+    talking"); it does not stop a captured request from being replayed
+    verbatim within its validity window — this closes that specific gap for
+    the three money-path endpoints (/pad/check, /liveness/challenge,
+    /liveness/verdict) WITHOUT a nonce-store or any new infrastructure, per
+    explicit owner decision (KENDRICK security analysis, 2026-07-18).
+
+    Deliberately coarse: this does not detect replay of the SAME request
+    within the tolerance window (no nonce/dedup), it only bounds how long a
+    captured request stays replayable at all.
+
+    DISABLED BY DEFAULT (settings.REPLAY_PROTECTION_ENABLED=False) — the
+    partner must start sending X-Request-Timestamp (unix seconds) on every
+    money-path call BEFORE this flips on in prod, or their existing traffic
+    starts failing 401. Mirrors the empty-SERVICE_TOKEN dev/prod pattern
+    above: a settings flag gates the check, not a hardcoded constant.
+    """
+    if not settings.REPLAY_PROTECTION_ENABLED:
+        return
+    if not x_request_timestamp:
+        raise HTTPException(status_code=401, detail="Missing X-Request-Timestamp")
+    try:
+        request_ts = float(x_request_timestamp)
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid X-Request-Timestamp")
+    # 2PAC (2026-07-18): `float("nan")` parses successfully (valid IEEE754),
+    # and abs(now - nan) is nan — every comparison against nan (including
+    # `nan > REPLAY_TOLERANCE_S`) is False per IEEE754, so the `>` check
+    # below silently never raises for "nan"/"NaN"/"+nan"/"-nan" (any case).
+    # That was a full bypass of this entire guard. math.isfinite() rejects
+    # nan AND +-inf explicitly, rather than relying on comparison fallout.
+    if not math.isfinite(request_ts):
+        raise HTTPException(status_code=401, detail="Invalid X-Request-Timestamp")
+    if abs(time.time() - request_ts) > settings.REPLAY_TOLERANCE_S:
+        raise HTTPException(status_code=401, detail="X-Request-Timestamp outside allowed window")
+
+
 def _audit_entry(correlation_id: str, transaction_type: str, transaction_ref: str,
                  verdict: str, score: float, signals: dict, processing_ms: float,
                  save_frame: bool, reason: Optional[str] = None) -> None:
@@ -866,6 +907,7 @@ def _audit_entry(correlation_id: str, transaction_type: str, transaction_ref: st
 async def pad_check(
     req: PadCheckRequest,
     x_service_token: Optional[str] = Header(None, alias="X-Service-Token"),
+    x_request_timestamp: Optional[str] = Header(None, alias="X-Request-Timestamp"),
 ) -> PadCheckResponse:
     """PAD-gate: classify a face frame as live/spoof/low_quality.
 
@@ -873,6 +915,7 @@ async def pad_check(
     Contract: FACEID_PHASE1_PAD_GATE.md §1.
     """
     _verify_service_token(x_service_token)
+    _verify_replay_protection(x_request_timestamp)
 
     t0 = time.perf_counter()
 
@@ -1168,6 +1211,7 @@ def _liveness_not_ready_response() -> JSONResponse:
 async def liveness_challenge(
     req: LivenessChallengeRequest,
     x_service_token: Optional[str] = Header(None, alias="X-Service-Token"),
+    x_request_timestamp: Optional[str] = Header(None, alias="X-Request-Timestamp"),
 ):
     """Generates a randomized challenge_spec and mints session_id. Laravel
     relays session_id + challenge_spec to the client unchanged when it
@@ -1176,6 +1220,7 @@ async def liveness_challenge(
     POST /liveness/verdict looks it up by session_id, it does not trust a
     client- or Laravel-supplied spec."""
     _verify_service_token(x_service_token)
+    _verify_replay_protection(x_request_timestamp)
 
     if not settings.LIVENESS_ENDPOINTS_ENABLED or not _liveness_models_loaded:
         return _liveness_not_ready_response()
@@ -1408,8 +1453,10 @@ def _run_liveness_verdict(req: LivenessVerdictRequest) -> LivenessVerdictRespons
 async def liveness_verdict(
     req: LivenessVerdictRequest,
     x_service_token: Optional[str] = Header(None, alias="X-Service-Token"),
+    x_request_timestamp: Optional[str] = Header(None, alias="X-Request-Timestamp"),
 ):
     _verify_service_token(x_service_token)
+    _verify_replay_protection(x_request_timestamp)
 
     if not settings.LIVENESS_ENDPOINTS_ENABLED or not _liveness_models_loaded:
         return _liveness_not_ready_response()

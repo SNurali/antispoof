@@ -50,6 +50,35 @@ class Settings(BaseSettings):
     RATE_LIMIT_SUSTAINED: float = 5.0  # sustained requests per second
     SAVE_FRAME_VERDICTS: str = "spoof"  # comma-separated verdicts that trigger save_frame=true
 
+    # Anti-replay timestamp window (KENDRICK security analysis, 2026-07-18;
+    # wired in alongside BUSTA RHYMES's mTLS transport layer, deploy/mtls/).
+    # mTLS authenticates the CHANNEL ("who is talking") but does not stop a
+    # captured request from being replayed verbatim within its validity
+    # window — this is a deliberately lightweight control layered ON TOP of
+    # the existing X-Service-Token + IP-allowlist (both UNCHANGED by this),
+    # requested explicitly in lieu of a nonce-store/Redis-dedup: the client
+    # sends X-Request-Timestamp (unix seconds, current time at request
+    # creation) and the server rejects anything outside
+    # +/-REPLAY_TOLERANCE_S of its own clock. This does NOT detect a replay
+    # of the SAME request within the window — it only bounds how long a
+    # captured request stays usable, trading precision for zero new
+    # infrastructure. Applies to the three money-path endpoints only
+    # (/pad/check, /liveness/challenge, /liveness/verdict) — see
+    # app/main.py::_verify_replay_protection and its call sites.
+    #
+    # DEFAULT DISABLED: the partner (Laravel/Umid's team) must start sending
+    # X-Request-Timestamp on every money-path call FIRST — flipping this on
+    # before they do turns every one of their existing requests into a 401.
+    # 50 CENT flips this on only after that is confirmed live, same rollout
+    # pattern as TRUST_PROXY_HEADERS above.
+    REPLAY_PROTECTION_ENABLED: bool = False
+    # Clock-skew + network/retry tolerance, in seconds. 120s is deliberately
+    # generous — wide enough to absorb NTP drift and a slow mobile network
+    # retry, narrow enough that a captured request stops being replayable
+    # within ~2 minutes. Configurable via env, not hardcoded, so it can be
+    # tightened once real production round-trip-time data exists.
+    REPLAY_TOLERANCE_S: int = 120
+
     # Layer 0 — document/passport-photo pre-filter (RZA, 2026-07-16).
     # DEFAULT DISABLED: calibration on incident_urgut (n=1 spoof / n=12 bonafide,
     # see app/document_check.py module docstring for full numbers) found 2 of 4
