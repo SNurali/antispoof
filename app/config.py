@@ -19,6 +19,14 @@ class Settings(BaseSettings):
     DEVICE: str = "auto"
     MAX_BATCH: int = 16
 
+    # Deploy environment marker (P0-3, 2026-07-18). "dev" (default) keeps the
+    # existing dev-mode warning-only behavior for an empty SERVICE_TOKEN.
+    # "prod" makes an empty SERVICE_TOKEN a hard startup failure — see
+    # app/main.py's SERVICE_TOKEN check right after Settings() is constructed.
+    # 50 CENT must set ENVIRONMENT=prod in antispoof.service on egaz-02.uz
+    # BEFORE this change is deployed, or the service will refuse to start.
+    ENVIRONMENT: str = "dev"
+
     # Phase 1 PAD-gate integration (BACKEND_REQUIREMENTS_2026-07-06)
     SERVICE_TOKEN: str = ""  # X-Service-Token shared secret with Laravel; empty = auth disabled
     RATE_LIMIT_BURST: int = 20  # max concurrent requests (per-second burst)
@@ -253,13 +261,29 @@ class Settings(BaseSettings):
     # UX duration itself).
     LIVENESS_SESSION_TTL_S: float = 90.0
 
-    # In-memory session store ONLY in this increment — sessions do not
-    # survive a process restart and are NOT shared across multiple uvicorn
-    # workers/replicas. Fine for a single-process dev/smoke deploy; a
-    # horizontally-scaled prod deployment (see FACEID_PHASE1_PAD_GATE.md
-    # §2 item 10, "конкурентность/процессы") needs a shared store (Redis)
-    # before this can run behind more than one worker process — tracked,
-    # not solved here.
+    # Challenge SessionStore backend (app/liveness_session.py::build_session_store).
+    # "memory" (default): in-memory dict, single-process only — fine for a
+    # single-worker dev/smoke deploy, matches the WEB_CONCURRENCY=1 guard in
+    # app/main.py. "redis": shared across any number of worker
+    # processes/replicas — REQUIRED before running with WEB_CONCURRENCY>1
+    # (see FACEID_PHASE1_PAD_GATE.md §2 item 10 and
+    # docs/LIVENESS_CONTRACT_v1.md §4 item 7, both now closed by this
+    # backend when selected + deployed). Explicit switch, never a silent
+    # fallback — build_session_store() raises at startup if backend=redis
+    # is set but Redis is unreachable.
+    SESSION_STORE_BACKEND: str = "memory"
+
+    # Redis connection URL, only used when SESSION_STORE_BACKEND=redis.
+    # Default targets a local dev Redis (redis-server on the default port,
+    # db 0). Prod (egaz-02.uz) needs an actual Redis instance provisioned
+    # before flipping SESSION_STORE_BACKEND=redis there — see 50 CENT
+    # deploy notes. Sessions are short-lived (TTL-bounded, see
+    # LIVENESS_SESSION_TTL_S below) and disposable — Redis persistence
+    # (RDB/AOF) is NOT required; a restart losing in-flight challenge
+    # sessions just makes the next /liveness/verdict for those sessions
+    # come back SESSION_NOT_FOUND, same user-facing failure mode as today's
+    # in-memory store restarting.
+    REDIS_URL: str = "redis://localhost:6379/0"
 
     # Inference timeout for POST /liveness/verdict — deliberately larger
     # than /pad/check's INFERENCE_TIMEOUT_S=2.0. Derived from the measured

@@ -6,6 +6,11 @@ opencv-python>=4.8.0,<5.0.0
 numpy>=1.24.0
 pillow>=10.0.0
 torch>=2.1.0
+redis>=5.0.0  # liveness challenge SessionStore, SESSION_STORE_BACKEND=redis
+              # (app/liveness_session.py::RedisSessionStore). Sync client
+              # deliberately (not redis.asyncio) — kept the SessionStore
+              # interface synchronous so app/main.py's call sites (create/
+              # get/consume) did not need to become async.
 
 # --- Active liveness (Phase 2, POST /liveness/challenge + /liveness/verdict) ---
 # Only imported/loaded when LIVENESS_ENDPOINTS_ENABLED=1 (app/config.py) — existing

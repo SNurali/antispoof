@@ -13,6 +13,14 @@ services:
       - SERVICE_TOKEN=${SERVICE_TOKEN:?Set SERVICE_TOKEN in .env}
       - RATE_LIMIT_BURST=20
       - RATE_LIMIT_SUSTAINED=5.0
+      # Uncomment both lines below (and the `redis` service further down) to
+      # run the liveness challenge SessionStore on Redis instead of
+      # in-memory — required before scaling this service to >1 worker/
+      # replica. See app/liveness_session.py + docs/LIVENESS_CONTRACT_v1.md
+      # §4 item 7. Left OFF by default: this compose file still describes a
+      # single-instance deploy, same as today.
+      # - SESSION_STORE_BACKEND=redis
+      # - REDIS_URL=redis://redis:6379/0
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8090/health"]
       interval: 30s
@@ -20,3 +28,17 @@ services:
       retries: 3
       start_period: 10s
     restart: unless-stopped
+
+  # Optional — only needed if SESSION_STORE_BACKEND=redis is enabled above.
+  # Sessions are short-lived (TTL-bounded, see LIVENESS_SESSION_TTL_S in
+  # app/config.py — default 90s challenge validity + up to 2x that in grace-
+  # window storage TTL) and fully disposable: losing them on a Redis restart
+  # just makes the next /liveness/verdict for those sessions come back
+  # SESSION_NOT_FOUND, the same user-facing failure as the in-memory store
+  # restarting today. RDB/AOF persistence is therefore NOT required.
+  # redis:
+  #   image: redis:7-alpine
+  #   command: ["redis-server", "--save", "", "--appendonly", "no"]
+  #   ports:
+  #     - "127.0.0.1:6379:6379"
+  #   restart: unless-stopped

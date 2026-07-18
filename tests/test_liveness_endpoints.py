@@ -230,20 +230,36 @@ class TestVerdictEndpoint:
         """R2 binding is keyed on correlation_id (per backend confirmation,
         agent-mesh 2026-07-17) — a verdict request for a DIFFERENT
         correlation_id than the one the session was minted for must be
-        rejected, even with a matching session_id."""
+        rejected, even with a matching session_id.
+
+        P0-5 (2026-07-18) integration test: mints a real session via
+        POST /liveness/challenge with correlation_id=A, then calls
+        POST /liveness/verdict with a deliberately different correlation_id=B
+        — exercising the exact real-integration scenario the code's own
+        'soft in this increment' comment (app/main.py::_run_liveness_verdict)
+        and docs/LIVENESS_CONTRACT_v1.md §3 flagged as unverified. Both A and
+        B must be present in `signals` for Laravel/audit diagnostics."""
         client, m = client_enabled
+        correlation_id_a = "correlation-A-session-created-with"
+        correlation_id_b = "correlation-B-sent-with-verdict"
         ch = client.post("/liveness/challenge", json={
-            "correlation_id": "c1", "transaction_type": "sale", "transaction_ref": "req1:ball1",
+            "correlation_id": correlation_id_a, "transaction_type": "sale", "transaction_ref": "req1:ball1",
         }).json()
         frames = [_frame(i) for i in range(m.settings.LIVENESS_MIN_FRAMES)]
         resp = client.post("/liveness/verdict", json={
-            "correlation_id": "DIFFERENT_CORRELATION_ID", "session_id": ch["session_id"], "transaction_type": "sale",
+            "correlation_id": correlation_id_b, "session_id": ch["session_id"], "transaction_type": "sale",
             "transaction_ref": "req1:ball1", "frames": frames,
         })
         assert resp.status_code == 200
         data = resp.json()
         assert data["verdict"] == "incomplete"
         assert data["reason"] == "SESSION_CORRELATION_MISMATCH"
+        # Both values present for diagnostics — session-side vs request-side.
+        assert data["signals"]["session_correlation_id"] == correlation_id_a
+        assert data["signals"]["request_correlation_id"] == correlation_id_b
+        # Response-level correlation_id echoes the REQUEST's value (not the
+        # session's) — same echo convention as every other /liveness/verdict path.
+        assert data["correlation_id"] == correlation_id_b
 
     def test_transaction_ref_mismatch_alone_is_not_rejected(self, client_enabled):
         """transaction_ref is passthrough-only for /liveness/* (the sale
@@ -397,6 +413,47 @@ class TestLivenessGeometryGate:
             assert data["verdict"] == "live"
         finally:
             m.settings.GEOMETRY_CHECK_ENABLED = True
+
+
+class TestLivenessVerdictInternalError:
+    """P0-1 (2026-07-18): an unhandled exception AFTER the request body has
+    already been parsed must be caught locally in the route handler (not the
+    generic app.exception_handler(Exception)) so the response carries the
+    correct model_version, the documented -1.0 'not computed' sentinel for
+    frame_consistency_score, and the request's own echo fields (session_id/
+    correlation_id/transaction_type/transaction_ref) instead of null."""
+
+    def test_internal_error_after_parsing_echoes_request_fields(self, client_enabled):
+        from fastapi.testclient import TestClient
+        client, m = client_enabled
+
+        ch = client.post("/liveness/challenge", json={
+            "correlation_id": "c-internal-error", "transaction_type": "sale", "transaction_ref": "req9:ball9",
+        }).json()
+        frames = [_frame(i) for i in range(m.settings.LIVENESS_MIN_FRAMES)]
+
+        m.landmark_detector.analyze.side_effect = RuntimeError("model exploded")
+
+        # raise_server_exceptions=False: we want the actual JSON response our
+        # handler builds, not Starlette re-raising the original exception.
+        with TestClient(m.app, raise_server_exceptions=False) as c:
+            resp = c.post("/liveness/verdict", json={
+                "correlation_id": "c-internal-error", "session_id": ch["session_id"],
+                "transaction_type": "sale", "transaction_ref": "req9:ball9", "frames": frames,
+            })
+
+        assert resp.status_code == 500
+        data = resp.json()
+        assert data["verdict"] == "incomplete"
+        assert data["reason"] == "INTERNAL_ERROR"
+        assert data["model_version"] == m.LIVENESS_MODEL_VERSION
+        assert data["model_version"] != m.MODEL_VERSION
+        assert data["frame_consistency_score"] == -1.0
+        assert data["session_id"] == ch["session_id"]
+        assert data["correlation_id"] == "c-internal-error"
+        assert data["transaction_type"] == "sale"
+        assert data["transaction_ref"] == "req9:ball9"
+        assert "model exploded" not in resp.text
 
 
 class TestLivenessBlinkEndToEnd:

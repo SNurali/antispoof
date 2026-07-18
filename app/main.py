@@ -13,9 +13,11 @@ Phase 1 PAD-gate hardening (2026-07-06):
 
 import asyncio
 import base64
+import hmac
 import json
 import logging
 import logging.handlers
+import os
 import time
 import uuid
 from collections import deque
@@ -42,7 +44,7 @@ from app.frame_qc import assess_frame
 from app.geometry_check import GeometryCheckResult, check_face_geometry
 from app.identity_consistency import compute_identity_consistency
 from app.liveness import LivenessEngine
-from app.liveness_session import SessionStore, generate_challenge_spec
+from app.liveness_session import build_session_store, generate_challenge_spec
 
 # ---------------------------------------------------------------------------
 # Logging: application + audit
@@ -78,9 +80,65 @@ settings = Settings()
 DEVICE = resolve_device(settings.DEVICE)
 
 if not settings.SERVICE_TOKEN:
+    # 2PAC review (2026-07-18): normalize before comparing — a bare `==`
+    # against the literal "prod" silently treats any typo/casing variant
+    # ("Prod", "PRODUCTION", "production", a stray leading/trailing space
+    # from a copy-pasted systemd Environment= line) as "dev", i.e. the exact
+    # failure mode this guard exists to prevent.
+    if settings.ENVIRONMENT.strip().lower() == "prod":
+        # P0-3 (2026-07-18): a silent dev-mode warning is not enough in prod —
+        # refuse to start rather than serve /pad/check + /liveness/* with auth
+        # OFF. Requires ENVIRONMENT=prod to be set in antispoof.service on
+        # egaz-02.uz in lockstep with this change (50 CENT, deploy-side).
+        raise RuntimeError(
+            "SERVICE_TOKEN is empty while ENVIRONMENT=prod — refusing to start "
+            "with X-Service-Token auth disabled in production. Set SERVICE_TOKEN "
+            "(shared secret with Laravel) before starting this service."
+        )
     log.warning(
         "SERVICE_TOKEN is empty — /pad/check auth is DISABLED (dev mode). "
         "Do NOT run in production without a SERVICE_TOKEN set."
+    )
+
+# P0-3 (2026-07-18), updated for the Redis session store: the in-memory
+# SessionStore backend (app/liveness_session.py) is NOT shared across
+# worker processes (see its module docstring) — a session minted by one
+# worker would be invisible to /liveness/verdict handled by a different
+# worker (silent SESSION_NOT_FOUND, not a crash), so multi-worker + the
+# memory backend must be caught at startup rather than rediscovered in
+# prod. The redis backend (SESSION_STORE_BACKEND=redis) IS shared across
+# workers, so it is exempt from this guard. WEB_CONCURRENCY is the
+# conventional env var for worker count (gunicorn/Heroku-style multi-worker
+# deploys); ctl.sh/antispoof.service do not set it today (single
+# `uvicorn ...` process, no --workers), but nothing stops a future deploy
+# change from doing so without touching this file.
+#
+# ⚠️ KNOWN GAP (2PAC review, 2026-07-18): this ONLY sees WEB_CONCURRENCY. If
+# someone runs `uvicorn app.main:app --workers 4` directly (no
+# WEB_CONCURRENCY env var set), uvicorn's CLI forks workers AFTER this
+# module has already been imported once in the parent process, and this
+# code cannot reliably read the CLI's own --workers value from in here
+# (uvicorn does not re-exec with an equivalent env var, and sys.argv in a
+# forked worker does not have to reflect it either). MUST-CHECK for 50 CENT
+# before any deploy config change: if a deploy ever launches uvicorn with
+# `--workers N` (N>1) instead of WEB_CONCURRENCY, this guard will NOT catch
+# it — either keep launching with a single worker + WEB_CONCURRENCY (or no
+# worker flag at all, today's setup), or set WEB_CONCURRENCY=N to match
+# --workers N so this guard actually sees it.
+try:
+    _web_concurrency = int((os.environ.get("WEB_CONCURRENCY") or "1").strip())
+except ValueError as _exc:
+    raise RuntimeError(
+        f"WEB_CONCURRENCY must be an integer, got {os.environ.get('WEB_CONCURRENCY')!r}"
+    ) from _exc
+if _web_concurrency > 1 and settings.SESSION_STORE_BACKEND.strip().lower() != "redis":
+    raise RuntimeError(
+        f"WEB_CONCURRENCY={_web_concurrency} (>1) but SESSION_STORE_BACKEND="
+        f"{settings.SESSION_STORE_BACKEND!r} (not 'redis') — the in-memory "
+        "session store is not shared across worker processes. Set "
+        "SESSION_STORE_BACKEND=redis (and REDIS_URL) before running with "
+        "more than one worker, or run with a single worker "
+        "(WEB_CONCURRENCY=1, no --workers flag)."
     )
 
 # Globals — initialized on startup
@@ -97,7 +155,11 @@ _models_loaded: bool = False
 # app/adaface.py, imported lazily inside _load_liveness_models().
 landmark_detector = None
 adaface_embedder = None
-session_store = SessionStore()  # cheap (pure Python), always constructed
+# Backend chosen via SESSION_STORE_BACKEND (memory|redis, app/config.py) —
+# see build_session_store() docstring for the no-silent-fallback contract.
+# Always constructed regardless of LIVENESS_ENDPOINTS_ENABLED, same as
+# before, so flipping that flag at runtime doesn't need a restart.
+session_store = build_session_store(settings)
 _liveness_models_loaded: bool = False
 
 # Layer 0 document-photo checker — cheap to construct (holds no model
@@ -206,14 +268,21 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
         )
     # For /liveness/verdict — fail-CLOSED per FACEID_ANTIBYPASS_UNIFIED_PLAN_v1.md
     # R1(в): an unhandled exception here must never look like "live".
+    # NOTE (P0-1, 2026-07-18): this generic handler is a fallback for
+    # exceptions that happen BEFORE the request body is parsed (e.g.
+    # malformed JSON) — session_id/correlation_id/transaction_type/
+    # transaction_ref are genuinely unavailable here, hence null. Once the
+    # body IS parsed, the route handler's own local try/except
+    # (app/main.py::liveness_verdict) takes over and echoes those fields —
+    # this branch should rarely fire in practice.
     if request.url.path == "/liveness/verdict":
         return JSONResponse(
             status_code=500,
             content={
                 "verdict": "incomplete",
                 "reason": "INTERNAL_ERROR",
-                "model_version": MODEL_VERSION,
-                "frame_consistency_score": 0.0,
+                "model_version": LIVENESS_MODEL_VERSION,
+                "frame_consistency_score": -1.0,
                 "best_frame_seq": None,
                 "session_id": None,
                 "correlation_id": None,
@@ -702,7 +771,10 @@ _save_frame_verdicts = set(v.strip() for v in settings.SAVE_FRAME_VERDICTS.split
 def _verify_service_token(x_service_token: Optional[str]) -> None:
     if not settings.SERVICE_TOKEN:
         return
-    if not x_service_token or x_service_token != settings.SERVICE_TOKEN:
+    # P0-2 (2026-07-18): constant-time comparison — a `!=` string compare
+    # short-circuits on the first mismatched byte, which is a timing side
+    # channel an attacker could use to guess SERVICE_TOKEN byte-by-byte.
+    if not x_service_token or not hmac.compare_digest(x_service_token, settings.SERVICE_TOKEN):
         raise HTTPException(status_code=401, detail="Invalid or missing X-Service-Token")
 
 
@@ -974,7 +1046,13 @@ class LivenessVerdictResponse(BaseModel):
     (Laravel must map it to a generic client-facing message/code so an
     attacker cannot calibrate an evasion attempt against per-signal
     feedback)."""
-    verdict: Literal["live", "spoof", "incomplete", "low_quality"]
+    # P0-4 (2026-07-18): narrowed from 4 to 3 values — "low_quality" had no
+    # live code path in _run_liveness_verdict (every "not enough data" case
+    # here uses "incomplete" instead, see docs/LIVENESS_CONTRACT_v1.md §2.1),
+    # it was a reserved-but-dead enum member. Scoped to THIS response model
+    # only — PadCheckResponse.verdict (/pad/check) legitimately uses
+    # "low_quality" and is untouched.
+    verdict: Literal["live", "spoof", "incomplete"]
     reason: Optional[str] = None
     model_version: str
     frame_consistency_score: float = Field(
@@ -1284,6 +1362,7 @@ async def liveness_verdict(
     if len(seqs) != len(set(seqs)):
         raise HTTPException(status_code=422, detail="duplicate frame seq values")
 
+    t0 = time.perf_counter()
     try:
         return await asyncio.wait_for(
             asyncio.to_thread(_run_liveness_verdict, req),
@@ -1305,4 +1384,40 @@ async def liveness_verdict(
             session_id=req.session_id, correlation_id=req.correlation_id,
             transaction_type=req.transaction_type, transaction_ref=req.transaction_ref,
             processing_ms=round(settings.LIVENESS_INFERENCE_TIMEOUT_S * 1000, 1), signals={},
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        # P0-1 (2026-07-18): local try/except instead of relying on the
+        # generic app.exception_handler(Exception) — by the time we get here
+        # req is ALREADY a parsed LivenessVerdictRequest, so
+        # session_id/correlation_id/transaction_type/transaction_ref are in
+        # scope and can be echoed correctly (the generic handler cannot see
+        # them and always echoes null). Deliberately local to this route, not
+        # a middleware/contextvar — this is the only endpoint that needs it.
+        ms = round((time.perf_counter() - t0) * 1000, 1)
+        log.exception(
+            "liveness_verdict: unhandled exception correlation=%s session=%s",
+            req.correlation_id, req.session_id,
+        )
+        _liveness_audit_entry(
+            req.correlation_id, req.session_id, req.transaction_type, req.transaction_ref,
+            "incomplete", "INTERNAL_ERROR", -1.0, ms,
+            n_frames_received=len(req.frames), n_frames_valid=0,
+        )
+        return JSONResponse(
+            status_code=500,
+            content={
+                "verdict": "incomplete",
+                "reason": "INTERNAL_ERROR",
+                "model_version": LIVENESS_MODEL_VERSION,
+                "frame_consistency_score": -1.0,
+                "best_frame_seq": None,
+                "session_id": req.session_id,
+                "correlation_id": req.correlation_id,
+                "transaction_type": req.transaction_type,
+                "transaction_ref": req.transaction_ref,
+                "processing_ms": ms,
+                "signals": {},
+            },
         )

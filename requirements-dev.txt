@@ -1,0 +1,13 @@
+# Dev/test-only dependencies. NOT installed in production (see
+# ctl.sh/antispoof.service, which only ever pip-installs requirements.txt).
+-r requirements.txt
+
+pytest
+
+# In-process fake Redis server for tests/test_redis_session_store.py —
+# avoids needing a real `redis-server` running in CI/dev while still
+# exercising the REAL RedisSessionStore code (Lua EVAL script included,
+# via the [lua] extra) instead of mocking it away. If a real Redis is
+# available (it is on this dev box, /usr/bin/redis-server), fakeredis
+# still gives the same guarantees for CI hosts that don't have one.
+fakeredis[lua]>=2.20.0
