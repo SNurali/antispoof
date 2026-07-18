@@ -190,6 +190,67 @@ ALLOWED_NETWORKS = [
     ipaddress.ip_network("172.16.0.0/12"),
 ]
 
+
+def _effective_client_ip(request: Request) -> str:
+    """Resolve the address the allowlist + rate limiter should judge.
+
+    Deployment topology (BUSTA RHYMES, deploy/mtls/nginx-antispoof-mtls.conf):
+    nginx terminates TLS+mTLS on the public interface and reverse-proxies to
+    uvicorn on 127.0.0.1 only (firewalled off from the outside). Once that
+    lands, request.client.host for EVERY external caller becomes nginx's own
+    loopback address — the allowlist below would silently stop filtering
+    anyone at all, since 127.0.0.0/8 is itself an allowed network.
+
+    settings.TRUST_PROXY_HEADERS (default False, see app/config.py) opts in
+    to reading X-Forwarded-For instead, but ONLY when the physical TCP peer
+    that reached uvicorn really is loopback (request.client.host is
+    127.0.0.1/::1) — the one legitimate case in this topology, since uvicorn
+    is loopback-only and the firewall blocks direct external access to its
+    port. If a request instead arrives from a NON-loopback peer while
+    TRUST_PROXY_HEADERS is on, something bypassed nginx (or nginx is
+    misconfigured) and reached uvicorn directly — X-Forwarded-For is then
+    attacker-controlled with no proxy in between to have appended a real
+    address, so it must be ignored and request.client.host used as-is.
+
+    deploy/mtls/nginx-antispoof-mtls.conf sets
+    `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`. nginx's
+    $proxy_add_x_forwarded_for APPENDS $remote_addr (the address nginx
+    itself saw on the TCP connection) to whatever X-Forwarded-For value the
+    client already sent — it never replaces the header. With exactly one
+    trusted hop (nginx is the public edge here; nothing else sits in front
+    of it), the LAST entry in the resulting header is always the one nginx
+    itself wrote from the real TCP peer; every entry before it is
+    attacker-supplied input nginx merely passed through unchanged. Trusting
+    the FIRST entry instead would let anyone bypass the allowlist by simply
+    prepending a fake "trusted" IP to their own X-Forwarded-For request
+    header before it ever reaches nginx.
+    """
+    raw_ip = request.client.host if request.client else "0.0.0.0"
+
+    if not settings.TRUST_PROXY_HEADERS:
+        return raw_ip
+
+    try:
+        parsed = ipaddress.ip_address(raw_ip)
+    except ValueError:
+        return raw_ip  # non-IP peer (e.g. TestClient) — nothing to trust-upgrade
+
+    if not parsed.is_loopback:
+        return raw_ip  # direct connection bypassing nginx — never trust X-Forwarded-For
+
+    xff = request.headers.get("x-forwarded-for", "")
+    hops = [hop.strip() for hop in xff.split(",") if hop.strip()]
+    if not hops:
+        return raw_ip
+
+    real_client = hops[-1]
+    try:
+        ipaddress.ip_address(real_client)
+    except ValueError:
+        return raw_ip  # malformed header — fail back to the (loopback) peer address
+
+    return real_client
+
 # ---------------------------------------------------------------------------
 # Rate limiter — sliding window, per-IP
 # ---------------------------------------------------------------------------
@@ -315,7 +376,7 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
 # ---------------------------------------------------------------------------
 @app.middleware("http")
 async def security_and_rate_limit(request: Request, call_next):
-    raw_ip = request.client.host if request.client else "0.0.0.0"
+    raw_ip = _effective_client_ip(request)
     try:
         client_ip = ipaddress.ip_address(raw_ip)
         ip_str = str(client_ip)

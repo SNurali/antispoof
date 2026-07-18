@@ -27,6 +27,23 @@ class Settings(BaseSettings):
     # BEFORE this change is deployed, or the service will refuse to start.
     ENVIRONMENT: str = "dev"
 
+    # Reverse-proxy topology (BUSTA RHYMES, deploy/mtls/, 2026-07-18).
+    # DEFAULT FALSE: today uvicorn listens directly on HOST:PORT (0.0.0.0 by
+    # default) and request.client.host in app/main.py's IP allowlist is the
+    # real caller's address. Once deploy/mtls/nginx-antispoof-mtls.conf is
+    # rolled out (nginx :443 TLS+mTLS -> uvicorn on 127.0.0.1 only, external
+    # access to PORT blocked by firewall), EVERY external caller's
+    # request.client.host becomes nginx's own loopback address — the
+    # allowlist would silently stop filtering anyone (127.0.0.0/8 is itself
+    # allowed). Set this to true ONLY when that nginx topology is actually
+    # live, so the allowlist reads the real client IP from X-Forwarded-For
+    # instead — see app/main.py::_effective_client_ip for the trust logic
+    # (X-Forwarded-For is only honored when the physical TCP peer is
+    # loopback; a direct, non-loopback connection — i.e. nginx bypassed —
+    # never trusts the header). 50 CENT flips this on at the same time the
+    # nginx config is deployed, not before.
+    TRUST_PROXY_HEADERS: bool = False
+
     # Phase 1 PAD-gate integration (BACKEND_REQUIREMENTS_2026-07-06)
     SERVICE_TOKEN: str = ""  # X-Service-Token shared secret with Laravel; empty = auth disabled
     RATE_LIMIT_BURST: int = 20  # max concurrent requests (per-second burst)

@@ -2,6 +2,10 @@
 certs/
 *.pem
 *.key
+*.crt
+*.csr
+*.p12
+deploy/mtls/output/
 
 # --- Python ---
 __pycache__/
