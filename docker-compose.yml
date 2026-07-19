@@ -1,44 +1,79 @@
-version: "3.8"
+# Antispoof — Docker deploy stack (egaz-02-compatible, CPU-only, no mTLS).
+# Two services: antispoof (this API) + redis (liveness challenge SessionStore).
+# Both are on a private `antispoof-net` bridge network; only antispoof's
+# 8090 is published, and ONLY on 127.0.0.1 — never 0.0.0.0 (see
+# deploy/MIGRATION_CHECKLIST_docker_v1.md for the incident this fixes).
+# Redis has NO `ports:` at all — it is reachable from antispoof over
+# antispoof-net by its service name only, never from the host or outside.
+#
+# `docker compose up -d` auto-loads a `.env` file from this directory both
+# for ${VAR} substitution in this file AND (via `env_file:` below) as the
+# antispoof container's actual environment. Copy .env.example to .env and
+# fill in SERVICE_TOKEN before running.
 
 services:
   antispoof:
     build: .
-    ports:
-      # Loopback-only publish — 0.0.0.0 bypasses host ufw/firewall rules.
-      # If Laravel runs on another host, use a private VPC IP instead of 0.0.0.0.
-      - "127.0.0.1:8090:8090"
+    image: antispoof:1.0.0-cpu
+    container_name: antispoof-app
+    env_file:
+      - .env
     environment:
-      - DEVICE=auto
-      - LIVENESS_THRESHOLD=0.5
-      - SERVICE_TOKEN=${SERVICE_TOKEN:?Set SERVICE_TOKEN in .env}
-      - RATE_LIMIT_BURST=20
-      - RATE_LIMIT_SUSTAINED=5.0
-      # Uncomment both lines below (and the `redis` service further down) to
-      # run the liveness challenge SessionStore on Redis instead of
-      # in-memory — required before scaling this service to >1 worker/
-      # replica. See app/liveness_session.py + docs/LIVENESS_CONTRACT_v1.md
-      # §4 item 7. Left OFF by default: this compose file still describes a
-      # single-instance deploy, same as today.
-      # - SESSION_STORE_BACKEND=redis
-      # - REDIS_URL=redis://redis:6379/0
+      # Fail FAST at `docker compose up` time (not just inside the app) if
+      # .env is missing SERVICE_TOKEN — compose resolves this ${...}
+      # substitution from its own auto-loaded .env before the container is
+      # even created. app/main.py's own startup RuntimeError (ENVIRONMENT=prod
+      # + empty SERVICE_TOKEN) is the second, independent line of defense.
+      - SERVICE_TOKEN=${SERVICE_TOKEN:?Set SERVICE_TOKEN in .env (see .env.example)}
+    ports:
+      # 127.0.0.1 ONLY. Binding 0.0.0.0 here bypasses host firewall/ufw
+      # rules — this is the exact misconfiguration the migration checklist
+      # (deploy/MIGRATION_CHECKLIST_docker_v1.md) exists to retire from the
+      # old systemd deploy (antispoof.service currently binds 0.0.0.0:8090).
+      - "127.0.0.1:8090:8090"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - antispoof-net
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8090/health"]
+      # start_period generous: torch + opencv + (if enabled) onnxruntime/
+      # insightface model load on a shared 8-vCPU Xeon E5-4620 v2 host can
+      # take longer than a typical FastAPI cold start.
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 10s
+      start_period: 30s
     restart: unless-stopped
 
-  # Optional — only needed if SESSION_STORE_BACKEND=redis is enabled above.
-  # Sessions are short-lived (TTL-bounded, see LIVENESS_SESSION_TTL_S in
-  # app/config.py — default 90s challenge validity + up to 2x that in grace-
-  # window storage TTL) and fully disposable: losing them on a Redis restart
-  # just makes the next /liveness/verdict for those sessions come back
-  # SESSION_NOT_FOUND, the same user-facing failure as the in-memory store
-  # restarting today. RDB/AOF persistence is therefore NOT required.
-  # redis:
-  #   image: redis:7-alpine
-  #   command: ["redis-server", "--save", "", "--appendonly", "no"]
-  #   ports:
-  #     - "127.0.0.1:6379:6379"
-  #   restart: unless-stopped
+  redis:
+    image: redis:7-alpine
+    container_name: antispoof-redis
+    # Sessions are short-lived (TTL-bounded, LIVENESS_SESSION_TTL_S=90s
+    # default) and fully disposable — see .env.example's SESSION_STORE_BACKEND
+    # comment. No RDB/AOF persistence needed; losing them on a Redis restart
+    # just makes the next /liveness/verdict for those sessions come back
+    # SESSION_NOT_FOUND, same user-facing failure as the in-memory store
+    # restarting.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    # NO ports: block — intentionally not published to the host at all.
+    # Reachable only from the antispoof container, over antispoof-net, as
+    # `redis:6379`. This is also why container/service naming here is
+    # prefixed antispoof- : the partner's own compose stack already runs an
+    # `api-egaz-redis-1` container on the same host — different compose
+    # project + different network, but keep names disjoint on purpose.
+    networks:
+      - antispoof-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+networks:
+  antispoof-net:
+    name: antispoof-net
+    driver: bridge

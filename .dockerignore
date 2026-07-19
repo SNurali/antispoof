@@ -1,0 +1,53 @@
+# Keep the build context small and never leak secrets/dev artifacts into an
+# image layer. Dockerfile only ever COPYs app/, models/, src/, requirements.txt,
+# entrypoint.sh — everything below is safe to exclude from the context.
+
+.git
+.gitattributes
+.gitignore
+
+.venv
+venv
+env
+ENV
+__pycache__
+*.py[cod]
+*.egg-info
+.eggs
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Secrets / generated certs — never send to the build context either.
+.env
+.env.*
+!.env.example
+certs/
+deploy/mtls/output/
+*.pem
+*.key
+*.crt
+*.csr
+*.p12
+
+*.log
+audit.log
+server.log
+service.log
+.pid
+
+# Docs, tests, scripts, dev-only tooling — not part of the runtime image.
+docs/
+tests/
+scripts/
+deploy/
+testpage/
+*.md
+requirements-dev.txt
+*.bak-*
+
+# Docker/VCS meta that should never itself be baked into the image.
+Dockerfile
+Dockerfile.gpu
+docker-compose.yml
+.dockerignore

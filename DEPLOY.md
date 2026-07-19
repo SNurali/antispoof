@@ -79,18 +79,35 @@ sudo loginctl enable-linger $(whoami)
 - HTTP (`MODE=http`): `http://<IP_СЕРВЕРА>:8090/` — работает, но веб-камера в браузере
   доступна только с `localhost`, с другого хоста getUserMedia будет заблокирован без TLS.
 
-## 3. Вариант B — Docker
+## 3. Вариант B — Docker (v1, 2026-07-19, рекомендуемый для передачи контрагенту)
+
+Полный пошаговый миграционный чек-лист (с чек-листом на инцидент "два uvicorn
+на 8090", остановкой systemd, откатом) — **`deploy/MIGRATION_CHECKLIST_docker_v1.md`**.
+Ниже — только краткая версия для локального запуска/разработки.
 
 ### 3.1. CPU (прод)
 
 ```bash
+cp .env.example .env   # обязательно заменить SERVICE_TOKEN=CHANGE_ME
+chmod 600 .env
 docker compose up -d
 ```
 
-`docker-compose.yml` уже настроен на CPU (`DEVICE=auto` определит `cpu`, т.к. в контейнере
-нет GPU-доступа). Порт пробрасывается `8090:8090`.
+`docker-compose.yml` поднимает **два** контейнера, оба CPU-only:
+- `antispoof-app` — сам сервис, `DEVICE=cpu` жёстко (не `auto`), порт
+  проброшен **строго на `127.0.0.1:8090`** (не `0.0.0.0`), non-root (uid 1000),
+  healthcheck (`curl /health`), запуск через `entrypoint.sh` с жёстко
+  зашитым `--workers 1` (не переопределяется никаким env);
+- `antispoof-redis` (`redis:7-alpine`) — SessionStore для liveness-challenge
+  (`SESSION_STORE_BACKEND=redis` в `.env.example`), **без** проброса порта на
+  хост — виден только `antispoof-app` внутри сети `antispoof-net`.
 
-Логи: `docker compose logs -f`
+Образ: `antispoof:1.0.0-cpu`, собранный локально ~2.4 ГБ,
+`docker save | gzip` ~1.1 ГБ (способ передачи без registry — см. чек-лист
+выше, раздел 4).
+
+Логи: `docker compose logs -f antispoof`
+Статус/health: `docker compose ps` (ожидаем `healthy` у обоих контейнеров)
 Остановка: `docker compose down`
 
 ### 3.2. GPU (опционально, не прод)
