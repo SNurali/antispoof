@@ -2,8 +2,8 @@
 
 import logging
 from pathlib import Path
-from typing import Annotated
-from pydantic import field_validator
+from typing import Annotated, Optional
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode
 
 log = logging.getLogger(__name__)
@@ -252,14 +252,28 @@ class Settings(BaseSettings):
     # own steps) for exactly this future recalibration to build on, without
     # a second implementation pass.
     LIVENESS_CHALLENGE_STEPS_POOL: str = "TURN_LEFT,TURN_RIGHT"
-    # How many steps to sample from the pool per session. With only 2
-    # supported steps today the entropy against a pre-recorded video-replay
-    # attack is low (2 possible orders = 1 bit) — ML_CORE §2.2 calls
-    # exactly this out as the reason randomization exists at all; 1 bit is
-    # a real but weak deterrent until BLINK (or another distinguishable
-    # step) is added. Tracked as an explicit known limitation, not silently
-    # accepted as "good enough".
-    LIVENESS_CHALLENGE_STEP_COUNT: int = 2
+    # How many steps to sample from the pool per session — a RANGE, not a
+    # fixed count (Challenge Entropy sprint, CHALLENGE_ENTROPY_SPRINT_v1.md
+    # §5.1, requirement dictated by Rustam's review §1 p.1). Replaces the old
+    # fixed `LIVENESS_CHALLENGE_STEP_COUNT=2`, which with only 2 supported
+    # steps meant "always both, ~1 bit of entropy" — ML_CORE §2.2's own
+    # complaint about this service. `app/liveness_session.py::
+    # generate_challenge_spec` samples `k = rng.randint(MIN, MAX)` each call,
+    # clamped to the CURRENT pool size (see that function's docstring) — with
+    # today's 2-step pool this clamps down to k=2 deterministically, i.e.
+    # PRODUCTION BEHAVIOR IS UNCHANGED until the pool actually grows past 4
+    # (Fase 5, volume rollout, separate from this sprint). The pool itself is
+    # NOT expanded here.
+    # MEDIUM finding (MF DOOM code review, 2026-07-20): `ge=0` rejects a
+    # negative count outright at startup (Pydantic ValidationError, fail
+    # fast). An INVERTED range (MIN > MAX) is deliberately NOT rejected here
+    # — `app/liveness_session.py::generate_challenge_spec` already clamps
+    # `lo = min(step_count_min, hi)` before `rng.randint`, so a misconfigured
+    # inverted range degrades to a narrower-but-still-valid range rather than
+    # crashing; rejecting it here too would be redundant defense that could
+    # itself reject a legitimate env-var rollout ordering.
+    LIVENESS_CHALLENGE_STEP_COUNT_MIN: int = Field(default=3, ge=0)
+    LIVENESS_CHALLENGE_STEP_COUNT_MAX: int = Field(default=4, ge=0)
 
     # Required yaw deviation (degrees) from the frontal reference for a
     # TURN_LEFT/TURN_RIGHT step to count as satisfied. ML_CORE §2.2's own
@@ -271,6 +285,26 @@ class Settings(BaseSettings):
     # Max |yaw| for a frame to count as the frontal reference/return-to-
     # center. Placeholder, not calibrated.
     LIVENESS_YAW_FRONTAL_MAX_DEG: float = 10.0
+
+    # NOD_UP/NOD_DOWN (CHALLENGE_ENTROPY_SPRINT_v1.md §4.1, Фаза 1) —
+    # required |pitch| deviation (degrees) for a nod step to count as
+    # satisfied, symmetric to LIVENESS_YAW_TURN_MIN_DEG above but on the
+    # pitch axis (`FrameFace.pose_pitch`, same landmark_3d_68 pass, no new
+    # inference — see app/active_challenge.py module docstring). Carried
+    # over the SAME 20.0 literature/ML_CORE number used for yaw, UNVERIFIED
+    # against a real device — the sign-convention caveat already documented
+    # for TURN_LEFT/TURN_RIGHT (app/active_challenge.py) applies here
+    # identically: which physical direction ("chin up" vs "chin down") maps
+    # to positive pitch has NOT been confirmed with a labeled real capture.
+    # If the sign is backwards, NOD_UP/NOD_DOWN swap meaning but the
+    # security property (some real pitch rotation happened) still holds.
+    # No separate "frontal" threshold is introduced for pitch — the
+    # existing global has_frontal gate below stays yaw-only, same as it
+    # already is for BLINK (this is a deliberate scope decision, not an
+    # oversight: NOD's own evidence-frame check does not require
+    # frontality, mirroring how TURN_LEFT/TURN_RIGHT's evidence frame is
+    # never itself "frontal" either).
+    LIVENESS_PITCH_NOD_MIN_DEG: float = 20.0
 
     # BLINK closed-eye cutoff for min(right_ear, left_ear) — see
     # app/active_challenge.py + app/face_landmarks.py::eye_aspect_ratios.
@@ -290,6 +324,91 @@ class Settings(BaseSettings):
     # concrete ask: a handful of people each captured performing a real
     # blink under production-like lighting).
     LIVENESS_EAR_BLINK_MAX: float = 0.20
+
+    # SMILE (CHALLENGE_ENTROPY_SPRINT_v1.md §4.1, Фаза 1) — minimum
+    # width/height ratio of the mouth's outer contour
+    # (app/face_landmarks.py::mouth_aspect_ratio) for a frame to count as
+    # smile evidence. UNCALIBRATED, and WEAKER than LIVENESS_EAR_BLINK_MAX's
+    # placeholder: EAR's 0.20 at least traces to a cited literature source
+    # (Soukupová & Čech 2016) for a well-studied signal; there is no
+    # equivalent widely-cited "MAR value = smiling" constant for this
+    # width/height formulation — no such number is invented here either.
+    # The ONLY real data point behind this placeholder is a same-domain
+    # sanity check (2026-07-20, same photo/method as the BLINK check above,
+    # see face_landmarks.py mouth-index verification comment): a NEUTRAL
+    # (non-smiling) frontal mouth on a real photo measured
+    # mouth_aspect_ratio()=2.56. No real smiling photo was available in
+    # this environment to measure the other end of the range, so 3.0 is
+    # chosen ONLY to clear that one neutral baseline with a small margin —
+    # it is NOT derived from any smiling-face measurement and could easily
+    # be wrong in either direction (too low -> false SMILE on a relaxed
+    # face close to 2.56; too high -> real smiles never clear it). Detection
+    # stays reachable (SUPPORTED_STEPS) for future recalibration, but per
+    # the same rule already applied to BLINK: do NOT add SMILE to
+    # LIVENESS_CHALLENGE_STEPS_POOL on the strength of this constant alone
+    # — a real neutral+smiling session corpus is needed first (Фаза 5,
+    # Волна 2, CHALLENGE_ENTROPY_SPRINT_v1.md §8).
+    LIVENESS_MAR_SMILE_MIN: float = 3.0
+
+    # Фаза 2 (CHALLENGE_ENTROPY_SPRINT_v1.md §5.3) — диапазон, из которого
+    # `app/liveness_session.py::generate_step_windows` сэмплирует случайное
+    # окно задержки на КАЖДЫЙ шаг challenge (ChallengeSpec.step_windows,
+    # новое аддитивное поле). 400/1500 — ПРЕДВАРИТЕЛЬНЫЕ значения, ничего не
+    # придумано под "красивое число": это не согласовано с Рустамом/UX и не
+    # проверено против реального CPU-бюджета инференса (LIVENESS_INFERENCE_
+    # TIMEOUT_S=8.0s уже под риском по латентности — см. §4 п.3
+    # LIVENESS_CONTRACT_v1.md), см. §9 п.2 плана — открытый вопрос владельцу.
+    # Timing-валидация на основе этих окон (LIVENESS_TIMING_VALIDATION_ENABLED
+    # ниже) идёт мягким rollout'ом именно поэтому — жёстко резать вердикт по
+    # несогласованным цифрам нельзя.
+    # MEDIUM finding (MF DOOM code review, 2026-07-20): same `ge=0` fail-fast
+    # for a negative delay; an inverted range (MIN > MAX) is likewise
+    # deliberately left to `generate_step_windows`'s own
+    # `min(delay_min_ms, delay_max_ms)`/`max(...)` clamp (see that function's
+    # docstring) rather than duplicated here as a hard validator.
+    LIVENESS_STEP_DELAY_MIN_MS: int = Field(default=400, ge=0)
+    LIVENESS_STEP_DELAY_MAX_MS: int = Field(default=1500, ge=0)
+
+    # Фаза 3.2 (§6.2) — серверная проверка `captured_at` (окно
+    # [t_instruction_shown, expires_at] + неубывание по seq) как ПЕРВЫЙ
+    # контур, независимый от M2-валидации, которую партнёр (Laravel) уже
+    # реализовал у себя как ВТОРОЙ контур (требование Рустама §1 п.3).
+    # МЯГКИЙ rollout, тот же паттерн, что уже прижился в этом репозитории
+    # для REPLAY_PROTECTION_ENABLED/TRUST_PROXY_HEADERS: DEFAULT DISABLED —
+    # `captured_at` остаётся Optional в схеме, партнёр должен СНАЧАЛА
+    # подтвердить, что стабильно шлёт его на каждом кадре, ПРЕЖДЕ чем этот
+    # флаг переключится в True и начнёт реально валить вердикт
+    # (`reason="CAPTURED_AT_INVALID"`). Пока False — аномалия (если
+    # `captured_at` вообще присутствует) только логируется в audit-log, ни
+    # один честный клиент, ещё не отправляющий это поле стабильно, не
+    # пострадает.
+    LIVENESS_CAPTURED_AT_VALIDATION_ENABLED: bool = False
+
+    # Фаза 3.3 (§6.3) — та же мягкая механика, но для соблюдения
+    # `step_windows` (Фаза 2 выше). Зависит от Фазы 2 (существование самих
+    # окон) И от партнёра (клиент должен реально начать их уважать) —
+    # включать раньше времени означает резать честный трафик, у которого
+    # просто ещё нет данных для соблюдения ещё не отправленных окон.
+    LIVENESS_TIMING_VALIDATION_ENABLED: bool = False
+
+    # Фаза 4 (§7) — рамка `quality_certified`, требование Рустама §1 п.2
+    # ("статус quality_certified допустим только при числовых целях
+    # APCER/BPCER"). ЭТО МЕХАНИЗМ, НЕ ЧИСЛА — значения ниже НЕ придуманы "для
+    # галочки", они намеренно `None`/`False` до реального согласования
+    # Нурали+Рустама (см. §9 п.1 плана) и реального замера на multi-frame
+    # корпусе (§7.1, CALIBRATION_REPORT.md, ещё не существует).
+    LIVENESS_TARGET_APCER: Optional[float] = None  # согласование Нурали+Рустам
+    LIVENESS_TARGET_BPCER: Optional[float] = None  # согласование Нурали+Рустам
+    # РУЧНОЙ флаг sign-off (НЕ авто-вычисляемый ни из каких метрик в этом
+    # коде) — переключается владельцем ПОСЛЕ того, как замеренные APCER/BPCER
+    # из CALIBRATION_REPORT.md пройдены против целей выше (§7.3).
+    LIVENESS_QUALITY_CERTIFIED: bool = False
+    # `model_version`, на котором был прогнан сертифицирующий отчёт — должен
+    # совпадать с LIVENESS_MODEL_VERSION деплоя, когда LIVENESS_QUALITY_
+    # CERTIFIED=True (защита от "сертифицировали одну версию, задеплоили
+    # другую"), см. стартап-проверку в app/main.py рядом с определением
+    # LIVENESS_MODEL_VERSION.
+    LIVENESS_CERTIFIED_MODEL_VERSION: Optional[str] = None
 
     # Frame count bounds per FACEID_ANTIBYPASS_UNIFIED_PLAN_v1.md §1.2
     # ("4-6 ключевых кадров"). Below MIN -> verdict=incomplete; above MAX

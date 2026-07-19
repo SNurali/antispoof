@@ -44,9 +44,10 @@
 | Поле | Тип | Описание |
 |---|---|---|
 | `session_id` | `str` | UUID4, минтит ЭТОТ сервис (`SessionStore.create`). |
-| `challenge_spec.steps` | `list[str]` | Рандомизированный подмножество+порядок из пула. **Текущий пул: `["TURN_LEFT", "TURN_RIGHT"]`** (`LIVENESS_CHALLENGE_STEPS_POOL`), сэмплится `LIVENESS_CHALLENGE_STEP_COUNT=2` шага — при пуле из 2 элементов это **всегда оба шага, в случайном порядке** (2 перестановки = 1 бит энтропии против video-replay). `BLINK` в проде НЕ участвует (см. §4). |
+| `challenge_spec.steps` | `list[str]` | Рандомизированный подмножество+порядок из пула. **Текущий пул: `["TURN_LEFT", "TURN_RIGHT"]`** (`LIVENESS_CHALLENGE_STEPS_POOL`). **Обновлено (Challenge Entropy sprint, `docs/plans/CHALLENGE_ENTROPY_SPRINT_v1.md`):** число шагов `k` теперь СЛУЧАЙНОЕ из диапазона `LIVENESS_CHALLENGE_STEP_COUNT_MIN=3` / `_MAX=4` (было фиксированное `LIVENESS_CHALLENGE_STEP_COUNT=2`), и клампится к текущему размеру пула — при пуле=2 (сегодня) это по-прежнему схлопывается в `k=2` детерминированно, т.е. **фактическое поведение в проде НЕ изменилось** (оба шага, в случайном порядке), диапазон реально заработает только когда пул вырастет (Фаза 5 того же плана, отдельно от этого изменения). ГСЧ — теперь `secrets.SystemRandom()` (криптостойкий), не модуль `random`. `BLINK` в проде НЕ участвует (см. §4). |
 | `challenge_spec.min_frames` | `int` | `4` (`LIVENESS_MIN_FRAMES`) |
 | `challenge_spec.max_frames` | `int` | `6` (`LIVENESS_MAX_FRAMES`) |
+| `challenge_spec.step_windows` | `list[StepWindow]` | **НОВОЕ, аддитивное поле** (Challenge Entropy sprint §5.3). `StepWindow = {step, min_delay_ms, max_delay_ms}` — случайное окно задержки ПОСЛЕ показа предыдущего шага/старта, сэмплированное тем же `secrets`-ГСЧ, из диапазона `LIVENESS_STEP_DELAY_MIN_MS=400`/`_MAX_MS=1500` (**ПРЕДВАРИТЕЛЬНЫЕ значения, не согласованы с Рустамом/UX** — см. §7 ниже). Старые клиенты, читающие только `steps`/`min_frames`/`max_frames`, не затронуты. |
 | `t_instruction_shown` | `float` | Unix timestamp выдачи — для проверки тайминга окна на клиенте. |
 | `expires_at` | `float` | Unix timestamp — `session_id` невалиден после этого момента. `TTL=90s` (`LIVENESS_SESSION_TTL_S`) — это **потолок с запасом на сеть/ретраи**, НЕ целевая длительность UX (целевая — 5-6с по ML_CORE §8, ещё не подтверждена владельцем). |
 | `model_version` | `str` | см. §0. |
@@ -57,7 +58,11 @@
   "challenge_spec": {
     "steps": ["TURN_RIGHT", "TURN_LEFT"],
     "min_frames": 4,
-    "max_frames": 6
+    "max_frames": 6,
+    "step_windows": [
+      {"step": "TURN_RIGHT", "min_delay_ms": 620, "max_delay_ms": 1140},
+      {"step": "TURN_LEFT", "min_delay_ms": 480, "max_delay_ms": 900}
+    ]
   },
   "t_instruction_shown": 1784298300.512,
   "expires_at": 1784298390.512,
@@ -87,7 +92,7 @@
 |---|---|---|
 | `seq` | `int` (`>=0`) | Порядковый номер кадра. |
 | `base64` | `str` | Base64 сырых байт JPEG/PNG (`base64.b64decode` → `cv2.imdecode`) — тот же формат, что `face_photo` в `/pad/check`. **Без `data:image/jpeg;base64,`-префикса** — с ним декод упадёт (см. ниже, деградирует per-frame, не роняет весь запрос). |
-| `captured_at` | `str \| null` | Опционально, не участвует в вычислениях сейчас (нет проверки временного окна между кадрами на сегодня). |
+| `captured_at` | `str \| null` | Опционально. **Обновлено (Challenge Entropy sprint §6.2/§6.3):** теперь МОЖЕТ участвовать в вычислениях — см. §7 ниже. Мягкий rollout: пока партнёр не подтвердил стабильную отправку на КАЖДОМ кадре, отсутствие поля НЕ является ошибкой и проверка просто не запускается. |
 
 **Валидация на уровне запроса (до бизнес-логики):**
 - `1 <= len(frames) <= 6` (`LIVENESS_MAX_FRAMES`), иначе `HTTP 422` со стандартным FastAPI-телом ошибки (`{"detail": "..."}`) — **НЕ** форма `LivenessVerdictResponse`.
@@ -136,9 +141,11 @@
 | `SESSION_CORRELATION_MISMATCH` | `correlation_id` запроса ≠ `correlation_id`, под которым была создана сессия — см. §3 | `incomplete` |
 | `DOCUMENT_PHOTO` | Layer 0a geometry-гейт словил документ/паспортное фото хотя бы на одном кадре — валит ВСЮ сессию, приоритет выше даже проверки `LIVENESS_MIN_FRAMES` | `spoof` |
 | `LOW_QUALITY_FRAMES` | Меньше 4 кадров прошли Layer 0 QC (резкость/поза/окклюзия) | `incomplete` |
-| `ACTIVE_CHALLENGE_NOT_IMPLEMENTED` | Layer 2 вернул `UNSUPPORTED_STEP` (шаг не из `{TURN_LEFT, TURN_RIGHT, BLINK}`) — в бою недостижимо, т.к. пул шагов сервис сам генерирует из поддерживаемых | `incomplete` |
+| `ACTIVE_CHALLENGE_NOT_IMPLEMENTED` | Layer 2 вернул `UNSUPPORTED_STEP` (шаг не из `{TURN_LEFT, TURN_RIGHT, BLINK, NOD_UP, NOD_DOWN, SMILE}`, `app/active_challenge.py::SUPPORTED_STEPS`) — в бою недостижимо, т.к. пул шагов сервис сам генерирует из поддерживаемых | `incomplete` |
 | `NO_FRONTAL_REFERENCE` | Ни один валидный кадр не попал в `|yaw| <= 10°` (`LIVENESS_YAW_FRONTAL_MAX_DEG`) — нет опорного фронтального кадра для оценки поворота | `incomplete` |
-| `CHALLENGE_FAILED` | Layer 2: запрошенный `TURN_LEFT`/`TURN_RIGHT` не обнаружен ни в одном кадре (`STEP_NOT_DETECTED`) | `spoof` |
+| `CHALLENGE_FAILED` | Layer 2: запрошенный шаг не обнаружен **в правильном порядке** ни в одном кадре (`STEP_NOT_DETECTED`). **Обновлено (Challenge Entropy sprint §6.1, БЕЗ фиче-флага, включено сразу):** доказательство шага `steps[i]` теперь ищется только среди кадров с `seq` СТРОГО БОЛЬШЕ `seq` доказательства шага `steps[i-1]` — кадры, поданные в неправильном порядке, больше НЕ проходят (раньше поиск шёл по всей серии без учёта порядка). Тот же код `reason`, что и раньше — клиенту/Laravel не нужно различать "шага не было" от "шаг был, но не в том порядке". | `spoof` |
+| `CAPTURED_AT_INVALID` | Фаза 3.2 (§6.2, §7 ниже), ТОЛЬКО когда `LIVENESS_CAPTURED_AT_VALIDATION_ENABLED=True`: `captured_at` вне окна `[t_instruction_shown, expires_at]`, убывающий по `seq`, или непарсимый — при этом **все** кадры сессии его прислали (иначе проверка не запускается вовсе, см. §7) | `spoof` |
+| `TIMING_WINDOW_VIOLATED` | Фаза 3.3 (§6.3, §7 ниже), ТОЛЬКО когда `LIVENESS_TIMING_VALIDATION_ENABLED=True`: интервал между `captured_at` кадра-доказательства шага и предыдущим шагом/`t_instruction_shown` вне `[min_delay_ms, max_delay_ms]` из `challenge_spec.step_windows` | `spoof` |
 | `IDENTITY_SWAP_MID_SESSION` | Layer 3: `min_similarity < IDENTITY_MIN(0.40)` — подозрение на подмену лица посреди сессии | `spoof` |
 | `PASSIVE_PAD_SPOOF` | Layer 1 (переиспользованный passive-PAD движок из `/pad/check`): хотя бы один валидный кадр размечен как `spoof` (агрегация `any_frame_spoof`, консервативная — см. §4) | `spoof` |
 | `TIMEOUT` | Обработка превысила `LIVENESS_INFERENCE_TIMEOUT_S=8.0s` | `incomplete` |
@@ -153,7 +160,10 @@
 - `layer3_identity_consistency`: `{"passed", "min_similarity", "reference_seq", "pairwise", "threshold"}` — появляется, если дошли до Layer 3.
 - `layer1_passive_pad`: `{"frames": [{"seq","label","score"}], "aggregate": "any_frame_spoof"}` — появляется, если дошли до Layer 1.
 - При `SESSION_CORRELATION_MISMATCH`: `{"session_correlation_id": "...", "request_correlation_id": "..."}` — оба значения для дебага несовпадения.
+- При `CAPTURED_AT_INVALID` (только `LIVENESS_CAPTURED_AT_VALIDATION_ENABLED=True`, §7.2): `signals.captured_at_validation.anomalies` — список `{seq, reason}` (`OUT_OF_WINDOW`/`NOT_MONOTONIC`/`UNPARSEABLE`).
+- При `TIMING_WINDOW_VIOLATED` (только `LIVENESS_TIMING_VALIDATION_ENABLED=True`, §7.3): `signals.timing_validation.anomalies` — список `{step, seq, delay_ms, expected_min_ms, expected_max_ms, reason}`, плюс весь остальной `base_signals`, накопленный до этой точки (Layer 0/0a/2).
 - Внутреннее поле `_n_valid` (счётчик валидных кадров) существует только в аудит-логе, **из внешнего `signals` вырезается** перед отправкой ответа — в теле HTTP-ответа его не будет.
+- `entry.soft_validation_anomalies` (§7.2/§7.3) — существует ТОЛЬКО в файловом/stdout audit-log (`_liveness_audit_entry`), НЕ в HTTP-ответе — то же место, куда пишется весь остальной аудит-трейл, ничего нового не заведено.
 
 ### 2.3 `INTERNAL_ERROR` (fail-closed путь) — ИСПРАВЛЕНО (P0-1, 2026-07-18)
 
@@ -254,3 +264,41 @@
 **Известное ограничение:** это НЕ nonce/dedup — окно НЕ отклоняет буквальный повтор ОДНОГО И ТОГО ЖЕ запроса внутри `REPLAY_TOLERANCE_S`, оно только ограничивает срок жизни перехваченного запроса. Осознанный компромисс владельца в пользу нулевой новой инфраструктуры (без Redis nonce-стора) — см. запрос задачи. Для `/liveness/verdict` одноразовость `session_id` (`session_store.consume`) остаётся отдельным, более сильным контролем ПОВЕРХ этого окна.
 
 Тесты: `tests/test_replay_protection.py` (валидный timestamp / просроченный / из будущего / отсутствующий заголовок / нечисловое значение / флаг выключен — для всех трёх money-path эндпоинтов, плюс регрессия что `/health` не затронут).
+
+---
+
+## 7. Порядок шагов, `captured_at` и `step_windows` — ПЕРВЫЙ контур (SNOOP, Challenge Entropy sprint, 2026-07-20)
+
+**Контекст:** `docs/plans/CHALLENGE_ENTROPY_SPRINT_v1.md`, прямое требование Рустама §1 п.3 — партнёр (Laravel) уже реализовал у себя M2-валидацию `captured_at` (окно challenge + неубывание по `seq`) как **ВТОРОЙ** контур; наша серверная проверка порядка/таймингов должна быть **ПЕРВЫМ**.
+
+### 7.1 Порядок шагов (`CHALLENGE_FAILED` / `STEP_NOT_DETECTED`) — БЕЗ фиче-флага, уже в проде
+
+Не ломает контракт (не новое обязательное поле, использует уже обязательный `seq`) — раскатано сразу, без флага, как чистое ужесточение уже существующей семантики `CHALLENGE_FAILED`/`STEP_NOT_DETECTED`. См. §2.1 выше и `app/active_challenge.py::verify_challenge` docstring.
+
+### 7.2 `captured_at` (окно + неубывание) — МЯГКИЙ rollout
+
+`settings.LIVENESS_CAPTURED_AT_VALIDATION_ENABLED` (`app/config.py`), **DEFAULT FALSE** — тот же паттерн rollout'а, что уже прижился в этом репозитории для `REPLAY_PROTECTION_ENABLED` (§6 выше):
+
+1. `False` (сейчас): если `captured_at` присутствует на ВСЕХ кадрах сессии — проверяется окно `[t_instruction_shown, expires_at]` и неубывание по `seq`, аномалия **только логируется** в существующий audit-log (`entry.soft_validation_anomalies.captured_at`), вердикт НЕ режется. Если `captured_at` отсутствует хотя бы на одном кадре — проверка вообще не запускается (не ошибка, ожидаемое переходное состояние).
+2. Партнёр (мобильный клиент через `egaz-mobile`) подтверждает, что стабильно шлёт `captured_at` на КАЖДОМ кадре.
+3. Только после этого — `LIVENESS_CAPTURED_AT_VALIDATION_ENABLED=true`: аномалия начинает реально резать вердикт (`verdict="spoof"`, `reason="CAPTURED_AT_INVALID"`, `signals.captured_at_validation` содержит список найденных аномалий по `seq`).
+
+**⚠️ ТРЕБОВАНИЕ ФОРМАТА (HIGH finding, MF DOOM code review, 2026-07-20 — решение владельца/бригадира):** `captured_at`, когда присутствует, **ОБЯЗАН нести явный offset/timezone** — либо суффикс `Z` (UTC, рекомендуется, как в примере §2), либо явный `+HH:MM`/`-HH:MM`. Naive-строка (без offset, например `"2026-07-17T14:32:00.100"`) **трактуется как НЕВАЛИДНАЯ** — та же ветка, что и синтаксически кривая строка (`UNPARSEABLE` в soft-режиме / `CAPTURED_AT_INVALID` в hard-режиме), НЕ как "предположительно UTC". Причина: молчаливая интерпретация naive-времени как UTC — это скрытое допущение в коде, а не гарантия контракта; сервер (egaz-02.uz) сам работает в UTC+5, и трактовка naive-строки через `datetime.timestamp()` без явного `tzinfo` интерпретировала бы её как ЛОКАЛЬНОЕ время СЕРВЕРА, а не время клиента — при включённой валидации это увело бы честный трафик в ложный `CAPTURED_AT_INVALID`. См. `app/main.py::_parse_captured_at` docstring.
+
+### 7.3 `step_windows` timing — МЯГКИЙ rollout, зависит от Фазы 2 И партнёра
+
+`settings.LIVENESS_TIMING_VALIDATION_ENABLED` (`app/config.py`), **DEFAULT FALSE**, тот же паттерн. Зависит от существования `challenge_spec.step_windows` (§1) И от того, что клиент реально начнёт эти окна уважать — включать раньше означало бы резать честный трафик, у которого просто ещё нет данных для соблюдения ещё не отправленных окон.
+
+**⚠️ Честная оговорка про точность:** сервер никогда не видит момент, когда клиент реально ПОКАЗАЛ инструкцию к шагу — только `captured_at` того кадра, который Layer 2 засчитал доказательством этого шага (`app/active_challenge.py::verify_challenge`, `detail.step_evidence_seq`). Это ПРОКСИ-измерение задержки, не точный замер UX-события — см. `app/main.py::_validate_step_windows` docstring.
+
+При `LIVENESS_TIMING_VALIDATION_ENABLED=true`: нарушение окна режет вердикт (`verdict="spoof"`, `reason="TIMING_WINDOW_VIOLATED"`, `signals.timing_validation` содержит список аномалий по шагу/`seq`/фактической задержке). При `False` — только `entry.soft_validation_anomalies.timing` в audit-log.
+
+**Диапазон `LIVENESS_STEP_DELAY_MIN_MS=400`/`_MAX_MS=1500` (`app/config.py`) — ПРЕДВАРИТЕЛЬНЫЙ**, не согласован с Рустамом/UX и не проверен против реального CPU-бюджета инференса (`LIVENESS_INFERENCE_TIMEOUT_S=8.0s` уже под риском по латентности, см. §4 п.3 выше) — открытый вопрос владельцу (`CHALLENGE_ENTROPY_SPRINT_v1.md` §9 п.2), не считать финальным UX-контрактом.
+
+### 7.4 Честное ограничение: `seq` и `captured_at` — поля, контролируемые клиентом (2PAC, условие снятия Q9, 2026-07-20)
+
+**Это ограничение, не код — фиксируется здесь для честности перед Рустамом.** Order-by-evidence (§7.1) и `captured_at`/timing-валидация (§7.2/§7.3) защищают от "ленивого" replay (тот же payload, поданный заново без учёта порядка/окна), но **НЕ от атакующего, который целенаправленно КОНСТРУИРУЕТ payload**, зная эти правила: и `seq`, и `captured_at` — значения, которые присылает клиент в теле запроса, сервис им доверяет как заявленным данным, а не проверяет независимо. Атакующий, воспроизводящий подготовленный video-replay, может расставить `seq` по возрастанию и подобрать `captured_at` внутри допустимого окна с правильной монотонностью — ни одна из проверок §7.1-§7.3 такую подделку не поймает, потому что обе опираются исключительно на то, что заявил сам клиент.
+
+**Для защиты от этого класса атаки нужен независимый серверный временной якорь** — например `received_at`, проставляемый сервисом в момент фактического приёма HTTP-запроса, а не то, что декларирует клиент. **Честная оговорка, а не пропущенный пункт:** в текущей форме API все кадры сессии приходят ОДНИМ `POST /liveness/verdict` (не по одному кадру за вызов) — то есть межкадровых СЕРВЕРНЫХ таймингов сегодня физически не существует, `received_at` дал бы только одну точку на всю сессию (момент приёма всего батча), а не per-frame якорь, сопоставимый по гранулярности с `captured_at`. Закрытие этого пробела потребовало бы либо смены протокола на потоковую/поштучную отправку кадров, либо иного механизма — это архитектурный вопрос, не входящий в скоуп текущего спринта (`CHALLENGE_ENTROPY_SPRINT_v1.md`), и открыт отдельно.
+
+Тесты: `tests/test_active_challenge.py` (order-by-evidence), `tests/test_liveness_session.py` (`generate_challenge_spec`/`generate_step_windows` — секретный ГСЧ, диапазон k, клампинг пула), `tests/test_liveness_endpoints.py` (сквозные HTTP-тесты на `step_windows` в ответе, captured_at soft/hard, timing soft/hard).

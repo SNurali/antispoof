@@ -31,16 +31,36 @@ rather than quietly degrading to in-memory (a silent fallback under
 multi-worker would reintroduce exactly the cross-worker
 SESSION_NOT_FOUND bug the Redis backend exists to close).
 """
+import dataclasses
 import json
 import logging
 import random
+import secrets
 import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
-from typing import Optional
+from typing import Optional, TypedDict
 
 logger = logging.getLogger(__name__)
+
+
+class StepWindowDict(TypedDict):
+    """LOW finding (MF DOOM code review, 2026-07-20): single source of truth
+    for the `step_windows` dict shape (`{step, min_delay_ms, max_delay_ms}`)
+    — previously this key set was duplicated informally across three call
+    sites (`generate_step_windows`'s return value here,
+    `ChallengeSession.step_windows`'s stored copy, and
+    `app/main.py::_validate_step_windows`'s reads via `window["step"]` /
+    `window["min_delay_ms"]` / `window["max_delay_ms"]`) with nothing tying
+    them together — a key rename in one place would silently desync from the
+    others with no type-checker signal. `TypedDict` costs nothing at runtime
+    (still a plain dict), but gives every one of those three sites the same
+    static contract."""
+
+    step: str
+    min_delay_ms: int
+    max_delay_ms: int
 
 
 @dataclass
@@ -62,17 +82,98 @@ class ChallengeSession:
     transaction_type: str
     transaction_ref: str
     used: bool = False
+    # Фаза 2 (docs/plans/CHALLENGE_ENTROPY_SPRINT_v1.md §5.3), НОВОЕ поле —
+    # окна тайминга сэмплированы ОДИН раз при выдаче challenge и должны быть
+    # той же самой копией, что и в LivenessChallengeResponse.challenge_spec
+    # (не пересэмплированы заново на verdict) — сессия единственный источник
+    # истины, тот же принцип, что уже действует для `steps`. Список dict'ов
+    # с ключами step/min_delay_ms/max_delay_ms (см. generate_step_windows).
+    # default_factory=list — старые вызовы .create()/ChallengeSession(...)
+    # без этого параметра (напр. существующие тесты) продолжают работать.
+    # Тип list[dict] (не list[StepWindowDict]) сознательно — RedisSessionStore
+    # десериализует это поле из чистого json.loads() (см. _to_session), где
+    # TypedDict не даёт рантайм-гарантий сверх обычного dict; StepWindowDict
+    # используется как СТАТИЧЕСКИЙ контракт на самих функциях-генераторах
+    # ниже и на _validate_step_windows (app/main.py), а не здесь.
+    step_windows: list[dict] = field(default_factory=list)
 
 
-def generate_challenge_spec(steps_pool: list[str], step_count: int, rng: Optional[random.Random] = None) -> list[str]:
-    """Randomized subset+order from the pool. See app/config.py
-    ::LIVENESS_CHALLENGE_STEPS_POOL for why the pool (and therefore the
-    entropy against video-replay) is small in this increment."""
-    rng = rng or random
+def generate_challenge_spec(
+    steps_pool: list[str],
+    step_count_min: int,
+    step_count_max: int,
+    rng: Optional[random.Random] = None,
+) -> list[str]:
+    """Randomized subset+order from the pool.
+
+    Фаза 0 (CHALLENGE_ENTROPY_SPRINT_v1.md §3): продовый дефолтный ГСЧ —
+    `secrets.SystemRandom()` (криптографически стойкий, на `os.urandom`), а
+    НЕ модуль `random` (предсказуемый Mersenne Twister, не годится как
+    единственный барьер энтропии против подготовленной video-replay атаки).
+    `secrets.SystemRandom` — drop-in подкласс `random.Random` (тот же
+    интерфейс `.sample`/`.randint`), поэтому сигнатура не меняется и
+    инъекция детерминированного `rng=random.Random(seed)` в тестах
+    продолжает работать как раньше.
+
+    Фаза 2 (§5.1): `step_count` стал диапазоном `[step_count_min,
+    step_count_max]` — конкретное k выбирается случайно ПРИ КАЖДОЙ генерации
+    (не фиксированное число, как раньше). Обе границы дополнительно КЛАМПЯТСЯ
+    к текущему размеру пула — если пул временно меньше step_count_min
+    (сегодня пул = 2 шага: TURN_LEFT/TURN_RIGHT, а MIN/MAX по умолчанию
+    3/4), диапазон честно ужимается до [len(pool), len(pool)], т.е.
+    k=len(pool) детерминированно — это ТА ЖЕ семантика, что была раньше при
+    фиксированном STEP_COUNT=2 (всегда оба шага), а не падение
+    `rng.sample`/`rng.randint` на невозможном диапазоне и не тихая порча
+    поведения. Пул расширяется только в Фазе 5 (волновая калибровка),
+    отдельно от этого изменения.
+    """
+    rng = rng or secrets.SystemRandom()
     pool = list(steps_pool)
-    k = min(step_count, len(pool))
+    hi = min(step_count_max, len(pool))
+    lo = min(step_count_min, hi)
+    k = rng.randint(lo, hi)
     chosen = rng.sample(pool, k)
     return chosen
+
+
+def generate_step_windows(
+    steps: list[str],
+    delay_min_ms: int,
+    delay_max_ms: int,
+    rng: Optional[random.Random] = None,
+) -> list[StepWindowDict]:
+    """Фаза 2 (§5.3): для каждого выбранного шага сэмплирует случайное окно
+    задержки `[min_delay_ms, max_delay_ms]` ВНУТРИ сконфигурированного
+    диапазона (`LIVENESS_STEP_DELAY_MIN_MS`/`_MAX_MS`, app/config.py) —
+    т.е. рандомизируется не только САМ факт задержки, но и ширина/границы
+    окна на каждый шаг, тем же `secrets`-ГСЧ, что и выбор шагов. Два
+    независимых сэмпла из диапазона сортируются, чтобы `min_delay_ms <=
+    max_delay_ms` было инвариантом всегда, а не "по счастливой случайности".
+
+    Дефолт ГСЧ — `secrets.SystemRandom()`, тот же принцип, что и в
+    `generate_challenge_spec` (см. её docstring про Фазу 0).
+
+    MEDIUM finding (MF DOOM code review, 2026-07-20): `delay_min_ms`/
+    `delay_max_ms` are CLAMPED to `(min(...), max(...))` BEFORE being passed
+    to `rng.randint` — symmetric to `generate_challenge_spec`'s own `lo, hi =
+    min(...), max(...)` clamp of `step_count_min`/`step_count_max` above.
+    Without this, a misconfigured `LIVENESS_STEP_DELAY_MIN_MS >
+    LIVENESS_STEP_DELAY_MAX_MS` in `app/config.py` (env var typo, swapped
+    values) would make `rng.randint(delay_min_ms, delay_max_ms)` raise
+    `ValueError: empty range for randrange()` — a 500 on every single
+    `/liveness/challenge` call, not a graceful degrade. Clamping here is
+    defense-in-depth alongside `app/config.py`'s own `Settings` validation
+    (`LIVENESS_STEP_DELAY_MIN_MS`/`_MAX_MS` no longer accept an inverted
+    range either) — this function does not trust the config layer alone."""
+    rng = rng or secrets.SystemRandom()
+    lo_bound, hi_bound = min(delay_min_ms, delay_max_ms), max(delay_min_ms, delay_max_ms)
+    windows: list[StepWindowDict] = []
+    for step in steps:
+        a = rng.randint(lo_bound, hi_bound)
+        b = rng.randint(lo_bound, hi_bound)
+        lo, hi = (a, b) if a <= b else (b, a)
+        windows.append({"step": step, "min_delay_ms": lo, "max_delay_ms": hi})
+    return windows
 
 
 class SessionStore:
@@ -89,6 +190,7 @@ class SessionStore:
         correlation_id: str,
         transaction_type: str,
         transaction_ref: str,
+        step_windows: Optional[list[dict]] = None,
     ) -> ChallengeSession:
         now = time.time()
         session = ChallengeSession(
@@ -99,6 +201,7 @@ class SessionStore:
             correlation_id=correlation_id,
             transaction_type=transaction_type,
             transaction_ref=transaction_ref,
+            step_windows=step_windows or [],
         )
         with self._lock:
             self._sessions[session.session_id] = session
@@ -199,9 +302,23 @@ class RedisSessionStore:
     def _decode(value):
         return value.decode() if isinstance(value, bytes) else value
 
+    _KNOWN_FIELDS = {f.name for f in dataclasses.fields(ChallengeSession)}
+
     @classmethod
     def _to_session(cls, data: dict) -> ChallengeSession:
-        return ChallengeSession(**data)
+        """MEDIUM finding (2PAC code review, 2026-07-20): drop any key not on
+        `ChallengeSession` before constructing it, instead of `ChallengeSession
+        (**data)` unconditionally. A rolling deploy (new worker writes a
+        session with a field an older worker's `ChallengeSession` dataclass
+        does not know about yet, e.g. a future additive field) would otherwise
+        make the OLD worker's `_to_session()` raise `TypeError: unexpected
+        keyword argument` on `get()`/`consume()` for that session — a crash on
+        read, not a graceful degrade, purely from version skew across
+        instances sharing the same Redis store. Filtering to known fields
+        means an old worker simply ignores a field it does not understand yet
+        (same "ignore unknown, do not crash" principle Pydantic v1 legacy code
+        elsewhere in this repo already follows for forward compatibility)."""
+        return ChallengeSession(**{k: v for k, v in data.items() if k in cls._KNOWN_FIELDS})
 
     def create(
         self,
@@ -210,6 +327,7 @@ class RedisSessionStore:
         correlation_id: str,
         transaction_type: str,
         transaction_ref: str,
+        step_windows: Optional[list[dict]] = None,
     ) -> ChallengeSession:
         now = time.time()
         session = ChallengeSession(
@@ -220,6 +338,7 @@ class RedisSessionStore:
             correlation_id=correlation_id,
             transaction_type=transaction_type,
             transaction_ref=transaction_ref,
+            step_windows=step_windows or [],
         )
         # Same 2x+60s grace window as SessionStore._sweep_expired_locked —
         # storage cleanup only, NOT the business-logic expiry check (see

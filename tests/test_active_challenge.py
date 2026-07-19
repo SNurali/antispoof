@@ -27,6 +27,29 @@ def _eye_landmarks(mode: str) -> np.ndarray:
     return lmk
 
 
+def _mouth_landmarks(mode: str) -> np.ndarray:
+    """Synthetic (68, 3) landmark array with only the 6 outer-mouth indices
+    consumed by mouth_aspect_ratio() populated (48 left corner, 50/52 upper
+    lip, 54 right corner, 56/58 lower lip — see face_landmarks.py's
+    mouth-index verification comment for why these are the right indices);
+    everything else stays zero. 'smile' geometry (wide, flat) gives
+    MAR=20/2=10.0 (well above any plausible threshold); 'neutral' geometry
+    gives MAR=10/4=2.5 — deliberately close to the REAL neutral-mouth
+    baseline measured on a real photo in face_landmarks.py (2.56), so this
+    synthetic case is a meaningful regression guard against the same number
+    LIVENESS_MAR_SMILE_MIN's placeholder was set relative to, not an
+    arbitrary shape."""
+    lmk = np.zeros((68, 3), dtype=np.float32)
+    width, gap = (20.0, 1.0) if mode == "smile" else (10.0, 2.0)
+    lmk[48] = (0.0, 0.0, 0.0)
+    lmk[54] = (width, 0.0, 0.0)
+    lmk[50] = (width * 0.25, -gap, 0.0)
+    lmk[58] = (width * 0.25, gap, 0.0)
+    lmk[52] = (width * 0.75, -gap, 0.0)
+    lmk[56] = (width * 0.75, gap, 0.0)
+    return lmk
+
+
 def _face(yaw: float, pitch: float = 0.0, landmark_68: np.ndarray = None) -> FrameFace:
     return FrameFace(
         bbox_xyxy=(0.0, 0.0, 100.0, 100.0),
@@ -97,6 +120,100 @@ class TestVerifyChallenge:
         assert result.passed is True
 
 
+class TestVerifyChallengeOrderByEvidence:
+    """Фаза 3.1 (CHALLENGE_ENTROPY_SPRINT_v1.md §6.1) — direct requirement
+    from Rustam's review §1 p.3: evidence for steps[i] must be found ONLY
+    among frames with seq strictly greater than the seq that satisfied
+    steps[i-1]. Before this change `verify_challenge` searched the WHOLE
+    series regardless of order — a session presenting TURN_LEFT evidence
+    before TURN_RIGHT evidence would satisfy a challenge asking for
+    ["TURN_RIGHT", "TURN_LEFT"] just as well. This must no longer pass."""
+
+    def test_reversed_order_fails_step_not_detected(self):
+        """Same frames as test_both_steps_satisfied_by_different_frames
+        (TURN_LEFT evidence at seq1, TURN_RIGHT evidence at seq3) — but the
+        challenge now asks for the OPPOSITE order. Previously this passed
+        (passed=True); it must now fail."""
+        frames = [(0, _face(0.0)), (1, _face(25.0)), (2, _face(0.0)), (3, _face(-25.0))]
+        result = verify_challenge(["TURN_RIGHT", "TURN_LEFT"], frames, _settings())
+        assert result.passed is False
+        assert result.reason == "STEP_NOT_DETECTED"
+        assert "TURN_LEFT" in result.detail["missing_steps"]
+
+    def test_correct_order_still_passes(self):
+        """Same frames, requested in the order they actually occurred —
+        must still pass (regression guard against over-tightening)."""
+        frames = [(0, _face(0.0)), (1, _face(25.0)), (2, _face(0.0)), (3, _face(-25.0))]
+        result = verify_challenge(["TURN_LEFT", "TURN_RIGHT"], frames, _settings())
+        assert result.passed is True
+        assert result.detail["step_evidence_seq"] == {"TURN_LEFT": 1, "TURN_RIGHT": 3}
+
+    def test_evidence_reused_before_pointer_is_rejected(self):
+        """A single frame satisfying BOTH directions is impossible by
+        construction here, but a frame at seq=0 that would satisfy
+        steps[1] must not be usable once the pointer has already advanced
+        past it — evidence strictly EARLIER than the previous step's match
+        cannot count, even if it is technically present in the series."""
+        # TURN_RIGHT evidence only at seq0 (before any TURN_LEFT evidence
+        # exists at all) — requesting TURN_LEFT first must not let TURN_RIGHT
+        # "borrow" that earlier frame.
+        frames = [(0, _face(-25.0)), (1, _face(0.0)), (2, _face(25.0))]
+        result = verify_challenge(["TURN_LEFT", "TURN_RIGHT"], frames, _settings())
+        assert result.passed is False
+        assert result.reason == "STEP_NOT_DETECTED"
+        assert "TURN_RIGHT" in result.detail["missing_steps"]
+
+    def test_blink_combined_with_turn_requires_correct_order(self):
+        """Order-by-evidence applies across step TYPES too, not just
+        TURN_LEFT/TURN_RIGHT — BLINK evidence before the requested TURN_LEFT
+        must not satisfy a ["TURN_LEFT", "BLINK"] challenge if the blink
+        happened first."""
+        frames = [
+            (0, _face(0.0, landmark_68=_eye_landmarks("open"))),
+            (1, _face(0.0, landmark_68=_eye_landmarks("closed"))),  # BLINK evidence, seq1
+            (2, _face(25.0, landmark_68=_eye_landmarks("open"))),   # TURN_LEFT evidence, seq2
+        ]
+        result = verify_challenge(["TURN_LEFT", "BLINK"], frames, _settings())
+        assert result.passed is False
+        assert result.reason == "STEP_NOT_DETECTED"
+        assert "BLINK" in result.detail["missing_steps"]
+
+    def test_missing_middle_step_does_not_advance_pointer_for_next_step(self):
+        """LOW finding, documenting test (2PAC code review, 2026-07-20):
+        `verify_challenge`'s order-by-evidence pointer (`last_matched_seq`)
+        only advances on a MATCH — a step that fails to find evidence
+        (`continue`s into `missing`) leaves the pointer exactly where the
+        PREVIOUS successfully-matched step left it. This documents that
+        behavior explicitly with a 3-step challenge where the MIDDLE step
+        has no evidence anywhere in the series: the third step's search
+        must still start right after the FIRST step's evidence seq, not be
+        blocked or otherwise shifted by the second step's failure.
+
+        steps = [TURN_LEFT, TURN_RIGHT, NOD_UP]:
+        - seq0: frontal reference (yaw=0, pitch=0)
+        - seq1: TURN_LEFT evidence (yaw=+25) -> pointer advances to seq1
+        - seq2: NOD_UP evidence (pitch=+25, yaw=0) — NOT a TURN_RIGHT match
+          (yaw=0, needs <=-20) anywhere in seq>1, so TURN_RIGHT is reported
+          missing and the pointer stays at seq1 (unchanged).
+        - NOD_UP is then searched starting from seq>last_matched_seq(=1),
+          i.e. seq2 is still in range and matches — proving the search
+          window for the step AFTER a missing one was not narrowed/shifted
+          by the missing step itself."""
+        frames = [
+            (0, _face(0.0, pitch=0.0)),
+            (1, _face(25.0, pitch=0.0)),   # TURN_LEFT evidence
+            (2, _face(0.0, pitch=25.0)),   # NOD_UP evidence, no TURN_RIGHT anywhere
+        ]
+        result = verify_challenge(["TURN_LEFT", "TURN_RIGHT", "NOD_UP"], frames, _settings())
+        assert result.passed is False
+        assert result.reason == "STEP_NOT_DETECTED"
+        assert result.detail["missing_steps"] == ["TURN_RIGHT"]
+        # The pointer for NOD_UP's search resumed right after TURN_LEFT's
+        # seq (1), not after some seq that only a matched TURN_RIGHT would
+        # have produced — evidenced by NOD_UP being found at seq2 at all.
+        assert result.detail["step_evidence_seq"] == {"TURN_LEFT": 1, "NOD_UP": 2}
+
+
 class TestVerifyChallengeBlink:
     """BLINK is implemented (2026-07-17) but deliberately not in the default
     pool — see app/config.py::LIVENESS_EAR_BLINK_MAX. These tests exercise
@@ -152,3 +269,139 @@ class TestVerifyChallengeBlink:
         ]
         result = verify_challenge(["TURN_LEFT", "BLINK"], frames, _settings())
         assert result.passed is True
+
+
+class TestVerifyChallengeNod:
+    """NOD_UP/NOD_DOWN (CHALLENGE_ENTROPY_SPRINT_v1.md §4.1, Фаза 1) —
+    implemented but deliberately not in the default pool (see
+    app/config.py::LIVENESS_PITCH_NOD_MIN_DEG for the sign-convention
+    caveat). Symmetric to TURN_LEFT/TURN_RIGHT's yaw check, so these tests
+    mirror TestVerifyChallenge's TURN tests 1:1 with pitch instead of yaw."""
+
+    def test_nod_up_is_a_supported_step(self):
+        frames = [(0, _face(0.0))]
+        result = verify_challenge(["NOD_UP"], frames, _settings())
+        assert result.reason != "UNSUPPORTED_STEP"
+
+    def test_nod_down_is_a_supported_step(self):
+        frames = [(0, _face(0.0))]
+        result = verify_challenge(["NOD_DOWN"], frames, _settings())
+        assert result.reason != "UNSUPPORTED_STEP"
+
+    def test_nod_up_detected_passes(self):
+        # frontal reference (yaw=0) + a frame pitched past the threshold
+        frames = [(0, _face(0.0, pitch=0.0)), (1, _face(0.0, pitch=25.0))]
+        result = verify_challenge(["NOD_UP"], frames, _settings())
+        assert result.passed is True
+        assert result.reason is None
+
+    def test_nod_down_detected_passes(self):
+        frames = [(0, _face(0.0, pitch=0.0)), (1, _face(0.0, pitch=-25.0))]
+        result = verify_challenge(["NOD_DOWN"], frames, _settings())
+        assert result.passed is True
+
+    def test_nod_in_wrong_direction_fails(self):
+        # frontal + pitch in the WRONG direction only
+        frames = [(0, _face(0.0, pitch=0.0)), (1, _face(0.0, pitch=25.0))]
+        result = verify_challenge(["NOD_DOWN"], frames, _settings())
+        assert result.passed is False
+        assert result.reason == "STEP_NOT_DETECTED"
+        assert "NOD_DOWN" in result.detail["missing_steps"]
+
+    def test_static_series_fails_nod_challenge(self):
+        """No pitch movement anywhere in the series — must not pass, same
+        class of guard as TestVerifyChallenge::test_static_series_fails_
+        multi_step_challenge."""
+        frames = [(0, _face(0.0, pitch=-2.2)), (1, _face(0.0, pitch=1.2)),
+                  (2, _face(0.0, pitch=3.9)), (3, _face(0.0, pitch=0.4))]
+        result = verify_challenge(["NOD_UP", "NOD_DOWN"], frames, _settings())
+        assert result.passed is False
+        assert result.reason == "STEP_NOT_DETECTED"
+
+    def test_nod_reversed_order_fails_order_by_evidence(self):
+        """Same order-by-evidence rule already covered for TURN in
+        TestVerifyChallengeOrderByEvidence — NOD_DOWN evidence appears
+        BEFORE NOD_UP evidence in seq, but the challenge asks for
+        ["NOD_UP", "NOD_DOWN"] — must fail, not silently reuse the
+        earlier-seq NOD_DOWN evidence out of order."""
+        frames = [(0, _face(0.0, pitch=0.0)), (1, _face(0.0, pitch=-25.0)),
+                  (2, _face(0.0, pitch=0.0)), (3, _face(0.0, pitch=25.0))]
+        result = verify_challenge(["NOD_UP", "NOD_DOWN"], frames, _settings())
+        assert result.passed is False
+        assert result.reason == "STEP_NOT_DETECTED"
+        assert "NOD_DOWN" in result.detail["missing_steps"]
+
+    def test_nod_correct_order_passes_with_evidence_seq_recorded(self):
+        frames = [(0, _face(0.0, pitch=0.0)), (1, _face(0.0, pitch=-25.0)),
+                  (2, _face(0.0, pitch=0.0)), (3, _face(0.0, pitch=25.0))]
+        result = verify_challenge(["NOD_DOWN", "NOD_UP"], frames, _settings())
+        assert result.passed is True
+        assert result.detail["step_evidence_seq"] == {"NOD_DOWN": 1, "NOD_UP": 3}
+
+    def test_nod_combined_with_turn_requires_both(self):
+        frames = [
+            (0, _face(0.0, pitch=0.0)),
+            (1, _face(25.0, pitch=0.0)),   # TURN_LEFT evidence
+            (2, _face(0.0, pitch=25.0)),   # NOD_UP evidence
+        ]
+        result = verify_challenge(["TURN_LEFT", "NOD_UP"], frames, _settings())
+        assert result.passed is True
+
+
+class TestVerifyChallengeSmile:
+    """SMILE (CHALLENGE_ENTROPY_SPRINT_v1.md §4.1, Фаза 1) — implemented but
+    deliberately not in the default pool (LIVENESS_MAR_SMILE_MIN is an
+    even weaker placeholder than BLINK's, see app/config.py). These tests
+    exercise the detection MECHANISM with synthetic geometry (smile
+    MAR=10.0 vs neutral MAR=2.5, the latter deliberately close to the real
+    neutral-mouth baseline measured in face_landmarks.py) — they prove the
+    wiring is correct, they do NOT stand in for a real-data threshold
+    calibration (no real smiling photo exists in this repo either)."""
+
+    def test_smile_is_a_supported_step(self):
+        frames = [(0, _face(0.0, landmark_68=_mouth_landmarks("neutral")))]
+        result = verify_challenge(["SMILE"], frames, _settings())
+        assert result.reason != "UNSUPPORTED_STEP"
+
+    def test_smile_detected_when_mar_rises_passes(self):
+        frames = [
+            (0, _face(0.0, landmark_68=_mouth_landmarks("neutral"))),
+            (1, _face(0.0, landmark_68=_mouth_landmarks("smile"))),
+            (2, _face(0.0, landmark_68=_mouth_landmarks("neutral"))),
+        ]
+        result = verify_challenge(["SMILE"], frames, _settings())
+        assert result.passed is True
+        assert result.reason is None
+
+    def test_mouth_always_neutral_fails_smile(self):
+        """A static photo (or a live face that never smiles in the captured
+        window) must NOT pass a SMILE challenge — mirrors
+        TestVerifyChallengeBlink::test_eyes_always_open_fails_blink."""
+        frames = [
+            (0, _face(0.0, landmark_68=_mouth_landmarks("neutral"))),
+            (1, _face(0.0, landmark_68=_mouth_landmarks("neutral"))),
+        ]
+        result = verify_challenge(["SMILE"], frames, _settings())
+        assert result.passed is False
+        assert result.reason == "STEP_NOT_DETECTED"
+        assert "SMILE" in result.detail["missing_steps"]
+
+    def test_missing_landmark_68_treated_as_no_evidence_for_smile(self):
+        frames = [(0, _face(0.0, landmark_68=None))]
+        result = verify_challenge(["SMILE"], frames, _settings())
+        assert result.passed is False
+        assert result.reason == "STEP_NOT_DETECTED"
+
+    def test_smile_combined_with_turn_requires_correct_order(self):
+        """Order-by-evidence applies to SMILE too — SMILE evidence before
+        the requested TURN_LEFT must not satisfy a ["TURN_LEFT", "SMILE"]
+        challenge if the smile happened first."""
+        frames = [
+            (0, _face(0.0, landmark_68=_mouth_landmarks("neutral"))),
+            (1, _face(0.0, landmark_68=_mouth_landmarks("smile"))),  # SMILE evidence, seq1
+            (2, _face(25.0, landmark_68=_mouth_landmarks("neutral"))),  # TURN_LEFT evidence, seq2
+        ]
+        result = verify_challenge(["TURN_LEFT", "SMILE"], frames, _settings())
+        assert result.passed is False
+        assert result.reason == "STEP_NOT_DETECTED"
+        assert "SMILE" in result.detail["missing_steps"]

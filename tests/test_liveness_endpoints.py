@@ -4,7 +4,10 @@ detector / AdaFace embedder are MOCKED (same pattern as test_pad_check.py's
 detector/engine mocks) so these tests do not require the real 260MB ONNX
 weight file or insightface's buffalo_l bundle to be present."""
 import base64
+import importlib
+import logging
 import os
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import cv2
@@ -27,6 +30,23 @@ def _make_base64_image(width: int = 200, height: int = 200) -> str:
 
 def _frame(seq: int) -> dict:
     return {"seq": seq, "base64": _make_base64_image(), "captured_at": None}
+
+
+def _yaw_for_step(step: str) -> float:
+    return 25.0 if step == "TURN_LEFT" else -25.0
+
+
+def _yaws_matching_step_order(steps: list[str]) -> list[float]:
+    """Builds a [frontal, evidence(steps[0]), frontal, evidence(steps[1])]
+    yaw sequence matching WHATEVER order /liveness/challenge actually
+    returned. Phase 3.1 (order-by-evidence, CHALLENGE_ENTROPY_SPRINT_v1.md
+    §6.1) requires each requested step's evidence frame to have a strictly
+    LATER seq than the previous step's — tests can no longer hardcode a
+    fixed TURN_LEFT-then-TURN_RIGHT order now that `steps` order is
+    genuinely randomized (secrets ГСЧ, Фаза 0/2), so callers must build the
+    yaw sequence from the actual `challenge_spec.steps` returned."""
+    assert len(steps) == 2, "helper assumes today's 2-step pool (TURN_LEFT,TURN_RIGHT)"
+    return [0.0, _yaw_for_step(steps[0]), 0.0, _yaw_for_step(steps[1])]
 
 
 @pytest.fixture(autouse=True)
@@ -140,6 +160,38 @@ class TestChallengeEndpoint:
         assert data["challenge_spec"]["min_frames"] == m.settings.LIVENESS_MIN_FRAMES
         assert data["challenge_spec"]["max_frames"] == m.settings.LIVENESS_MAX_FRAMES
         assert "model_version" in data
+
+    def test_step_count_within_configured_range(self, client_enabled):
+        """Фаза 2 (§5.1): k теперь варьируется в [MIN, MAX], клампленный к
+        размеру пула — с сегодняшним 2-элементным пулом это схлопывается в
+        k=2 детерминированно (см. app/liveness_session.py::
+        generate_challenge_spec docstring), но контракт сам по себе должен
+        соблюдать диапазон, не полагаясь на сегодняшний размер пула."""
+        client, m = client_enabled
+        pool_size = len(set(s.strip() for s in m.settings.LIVENESS_CHALLENGE_STEPS_POOL.split(",")))
+        expected_min = min(m.settings.LIVENESS_CHALLENGE_STEP_COUNT_MIN, pool_size)
+        expected_max = min(m.settings.LIVENESS_CHALLENGE_STEP_COUNT_MAX, pool_size)
+        for _ in range(10):
+            data = client.post("/liveness/challenge", json={
+                "correlation_id": "c1", "transaction_type": "sale", "transaction_ref": "r:b",
+            }).json()
+            assert expected_min <= len(data["challenge_spec"]["steps"]) <= expected_max
+
+    def test_step_windows_present_and_valid(self, client_enabled):
+        """Фаза 2 (§5.3) / DoD п.2 плана: step_windows присутствует в ответе,
+        покрывает КАЖДЫЙ выбранный шаг в том же порядке, и min<=max для
+        каждого окна."""
+        client, m = client_enabled
+        data = client.post("/liveness/challenge", json={
+            "correlation_id": "c1", "transaction_type": "sale", "transaction_ref": "r:b",
+        }).json()
+        steps = data["challenge_spec"]["steps"]
+        windows = data["challenge_spec"]["step_windows"]
+        assert [w["step"] for w in windows] == steps
+        for w in windows:
+            assert w["min_delay_ms"] <= w["max_delay_ms"]
+            assert m.settings.LIVENESS_STEP_DELAY_MIN_MS <= w["min_delay_ms"]
+            assert w["max_delay_ms"] <= m.settings.LIVENESS_STEP_DELAY_MAX_MS
 
     def test_transaction_type_not_validated(self, client_enabled):
         """Unlike /pad/check's Literal['sale'], this endpoint passes
@@ -270,12 +322,16 @@ class TestVerdictEndpoint:
         request can reach `live`, proving the mismatch truly did not block
         anything downstream."""
         client, m = client_enabled
-        yaws = [0.0, 25.0, 0.0, -25.0, 0.0, 0.0]
-        m.landmark_detector.analyze.side_effect = [_mock_frame_face(yaw=y) for y in yaws]
-
         ch = client.post("/liveness/challenge", json={
             "correlation_id": "c1", "transaction_type": "sale", "transaction_ref": "req1:ball1",
         }).json()
+        # Yaw sequence built from the ACTUAL step order the challenge
+        # returned — order-by-evidence (Phase 3.1) means a hardcoded
+        # TURN_LEFT-then-TURN_RIGHT sequence would be flaky now that step
+        # order is genuinely randomized (secrets ГСЧ).
+        yaws = _yaws_matching_step_order(ch["challenge_spec"]["steps"])
+        m.landmark_detector.analyze.side_effect = [_mock_frame_face(yaw=y) for y in yaws]
+
         frames = [_frame(i) for i in range(m.settings.LIVENESS_MIN_FRAMES)]
         resp = client.post("/liveness/verdict", json={
             "correlation_id": "c1", "session_id": ch["session_id"], "transaction_type": "sale",
@@ -305,12 +361,12 @@ class TestVerdictEndpoint:
 
     def test_full_happy_path_reaches_live(self, client_enabled):
         client, m = client_enabled
-        yaws = [0.0, 25.0, 0.0, -25.0, 0.0, 0.0]
-        m.landmark_detector.analyze.side_effect = [_mock_frame_face(yaw=y) for y in yaws]
-
         ch = client.post("/liveness/challenge", json={
             "correlation_id": "c1", "transaction_type": "sale", "transaction_ref": "r:b",
         }).json()
+        yaws = _yaws_matching_step_order(ch["challenge_spec"]["steps"])
+        m.landmark_detector.analyze.side_effect = [_mock_frame_face(yaw=y) for y in yaws]
+
         frames = [_frame(i) for i in range(m.settings.LIVENESS_MIN_FRAMES)]
         resp = client.post("/liveness/verdict", json={
             "correlation_id": "c1", "session_id": ch["session_id"], "transaction_type": "sale",
@@ -396,12 +452,12 @@ class TestLivenessGeometryGate:
         client, m = client_enabled
         m.settings.GEOMETRY_CHECK_ENABLED = False
         try:
-            yaws = [0.0, 25.0, 0.0, -25.0, 0.0, 0.0]
-            m.landmark_detector.analyze.side_effect = [self._document_like_face(yaw=y) for y in yaws]
-
             ch = client.post("/liveness/challenge", json={
                 "correlation_id": "c1", "transaction_type": "sale", "transaction_ref": "r:b",
             }).json()
+            yaws = _yaws_matching_step_order(ch["challenge_spec"]["steps"])
+            m.landmark_detector.analyze.side_effect = [self._document_like_face(yaw=y) for y in yaws]
+
             frames = [_frame(i) for i in range(m.settings.LIVENESS_MIN_FRAMES)]
             resp = client.post("/liveness/verdict", json={
                 "correlation_id": "c1", "session_id": ch["session_id"], "transaction_type": "sale",
@@ -496,3 +552,304 @@ class TestLivenessBlinkEndToEnd:
         data = resp.json()
         assert data["verdict"] == "live"
         assert data["signals"]["layer2_active_challenge"]["passed"] is True
+
+
+def _captured_at_frames(count: int, offsets_s: list[float]) -> list[dict]:
+    now = datetime.now(timezone.utc)
+    assert len(offsets_s) == count
+    return [
+        {"seq": i, "base64": _make_base64_image(), "captured_at": (now + timedelta(seconds=offsets_s[i])).isoformat()}
+        for i in range(count)
+    ]
+
+
+class TestCapturedAtValidation:
+    """Фаза 3.2 (CHALLENGE_ENTROPY_SPRINT_v1.md §6.2) — мягкий rollout:
+    LIVENESS_CAPTURED_AT_VALIDATION_ENABLED=False (дефолт спринта) логирует
+    аномалию, не режет вердикт; =True режет с reason=CAPTURED_AT_INVALID."""
+
+    def _mint_session(self, m):
+        return m.session_store.create(
+            steps=["TURN_LEFT", "TURN_RIGHT"], ttl_s=90.0, correlation_id="c1",
+            transaction_type="sale", transaction_ref="r:b",
+        )
+
+    def test_soft_mode_logs_anomaly_without_failing_verdict(self, client_enabled):
+        client, m = client_enabled
+        assert m.settings.LIVENESS_CAPTURED_AT_VALIDATION_ENABLED is False  # sprint default
+
+        yaws = [0.0, 25.0, 0.0, -25.0]
+        m.landmark_detector.analyze.side_effect = [_mock_frame_face(yaw=y) for y in yaws]
+
+        session = self._mint_session(m)
+        # seq1's captured_at is EARLIER than seq0's — NOT_MONOTONIC anomaly,
+        # would be a hard fail if the flag were on, but it is not.
+        frames = _captured_at_frames(4, [1.0, 0.0, 2.0, 3.0])
+        resp = client.post("/liveness/verdict", json={
+            "correlation_id": "c1", "session_id": session.session_id, "transaction_type": "sale",
+            "transaction_ref": "r:b", "frames": frames,
+        })
+        assert resp.status_code == 200
+        assert resp.json()["verdict"] == "live"
+
+    def test_hard_mode_fails_verdict_with_captured_at_invalid(self, client_enabled):
+        client, m = client_enabled
+        m.settings.LIVENESS_CAPTURED_AT_VALIDATION_ENABLED = True
+        try:
+            session = self._mint_session(m)
+            frames = _captured_at_frames(4, [1.0, 0.0, 2.0, 3.0])  # same NOT_MONOTONIC anomaly as above
+            resp = client.post("/liveness/verdict", json={
+                "correlation_id": "c1", "session_id": session.session_id, "transaction_type": "sale",
+                "transaction_ref": "r:b", "frames": frames,
+            })
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["verdict"] == "spoof"
+            assert data["reason"] == "CAPTURED_AT_INVALID"
+        finally:
+            m.settings.LIVENESS_CAPTURED_AT_VALIDATION_ENABLED = False
+
+    def test_missing_captured_at_is_not_an_anomaly(self, client_enabled):
+        """captured_at absent on (some/all) frames must NOT be treated as an
+        anomaly in this increment — partner has not confirmed sending it
+        stably yet (§6.2)."""
+        client, m = client_enabled
+        m.settings.LIVENESS_CAPTURED_AT_VALIDATION_ENABLED = True
+        try:
+            yaws = [0.0, 25.0, 0.0, -25.0]
+            m.landmark_detector.analyze.side_effect = [_mock_frame_face(yaw=y) for y in yaws]
+            session = self._mint_session(m)
+            frames = [_frame(i) for i in range(4)]  # captured_at=None on every frame
+            resp = client.post("/liveness/verdict", json={
+                "correlation_id": "c1", "session_id": session.session_id, "transaction_type": "sale",
+                "transaction_ref": "r:b", "frames": frames,
+            })
+            assert resp.status_code == 200
+            assert resp.json()["reason"] != "CAPTURED_AT_INVALID"
+        finally:
+            m.settings.LIVENESS_CAPTURED_AT_VALIDATION_ENABLED = False
+
+    def test_naive_captured_at_treated_as_unparseable_soft_mode(self, client_enabled):
+        """HIGH finding (MF DOOM code review, 2026-07-20): a naive ISO string
+        (no 'Z'/offset) on EVERY frame must be reported as the UNPARSEABLE
+        anomaly (soft: logged only), NOT silently accepted as if it were a
+        valid, in-window UTC timestamp — see app/main.py::_parse_captured_at
+        and docs/LIVENESS_CONTRACT_v1.md §7.2."""
+        client, m = client_enabled
+        assert m.settings.LIVENESS_CAPTURED_AT_VALIDATION_ENABLED is False  # sprint default
+        yaws = [0.0, 25.0, 0.0, -25.0]
+        m.landmark_detector.analyze.side_effect = [_mock_frame_face(yaw=y) for y in yaws]
+        session = self._mint_session(m)
+        naive_now = datetime.now()  # deliberately NO tzinfo
+        frames = [
+            {"seq": i, "base64": _make_base64_image(), "captured_at": (naive_now + timedelta(seconds=i)).isoformat()}
+            for i in range(4)
+        ]
+        resp = client.post("/liveness/verdict", json={
+            "correlation_id": "c1", "session_id": session.session_id, "transaction_type": "sale",
+            "transaction_ref": "r:b", "frames": frames,
+        })
+        assert resp.status_code == 200
+        assert resp.json()["verdict"] == "live"  # soft mode: anomaly logged, verdict not cut
+
+    def test_naive_captured_at_fails_verdict_in_hard_mode(self, client_enabled):
+        """Same naive-string input as above, but with the flag on — must be
+        rejected exactly like a malformed/unparseable string, NOT silently
+        accepted as an in-window UTC timestamp just because it happens to
+        parse via datetime.fromisoformat."""
+        client, m = client_enabled
+        m.settings.LIVENESS_CAPTURED_AT_VALIDATION_ENABLED = True
+        try:
+            session = self._mint_session(m)
+            naive_now = datetime.now()
+            frames = [
+                {"seq": i, "base64": _make_base64_image(), "captured_at": (naive_now + timedelta(seconds=i)).isoformat()}
+                for i in range(4)
+            ]
+            resp = client.post("/liveness/verdict", json={
+                "correlation_id": "c1", "session_id": session.session_id, "transaction_type": "sale",
+                "transaction_ref": "r:b", "frames": frames,
+            })
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["verdict"] == "spoof"
+            assert data["reason"] == "CAPTURED_AT_INVALID"
+        finally:
+            m.settings.LIVENESS_CAPTURED_AT_VALIDATION_ENABLED = False
+
+
+class TestParseCapturedAt:
+    """Direct unit coverage of app/main.py::_parse_captured_at — HIGH finding
+    (MF DOOM code review, 2026-07-20). See docs/LIVENESS_CONTRACT_v1.md §7.2
+    for the contract-level requirement (`captured_at` MUST carry an
+    offset)."""
+
+    def test_naive_string_is_rejected(self):
+        import app.main as m
+        assert m._parse_captured_at("2026-07-17T14:32:00.100") is None
+
+    def test_aware_utc_z_suffix_parses(self):
+        import app.main as m
+        expected = datetime(2026, 7, 17, 14, 32, 0, 100000, tzinfo=timezone.utc).timestamp()
+        assert m._parse_captured_at("2026-07-17T14:32:00.100Z") == pytest.approx(expected)
+
+    def test_aware_plus_offset_normalizes_to_same_epoch_as_utc(self):
+        """An aware timestamp carrying a NON-UTC offset (+05:00, this
+        service's own server timezone on egaz-02.uz) must normalize to the
+        SAME unix epoch as the equivalent UTC 'Z' instant — proving the
+        offset is actually respected, not dropped/reinterpreted."""
+        import app.main as m
+        ts_utc = m._parse_captured_at("2026-07-17T14:32:00Z")
+        ts_plus5 = m._parse_captured_at("2026-07-17T19:32:00+05:00")
+        assert ts_plus5 == pytest.approx(ts_utc)
+
+    def test_malformed_string_is_rejected(self):
+        import app.main as m
+        assert m._parse_captured_at("not-a-timestamp") is None
+
+    def test_none_and_empty_string_are_rejected(self):
+        import app.main as m
+        assert m._parse_captured_at(None) is None
+        assert m._parse_captured_at("") is None
+
+
+class TestTimingWindowValidation:
+    """Фаза 3.3 (CHALLENGE_ENTROPY_SPRINT_v1.md §6.3) — тот же мягкий
+    паттерн, но для step_windows (Фаза 2). Окна намеренно недостижимые
+    (100-200с), реальный интервал между кадрами теста — секунды, поэтому
+    нарушение гарантировано без завязки на таймингах исполнения теста."""
+
+    _UNREACHABLE_WINDOWS = [
+        {"step": "TURN_LEFT", "min_delay_ms": 100_000, "max_delay_ms": 200_000},
+        {"step": "TURN_RIGHT", "min_delay_ms": 100_000, "max_delay_ms": 200_000},
+    ]
+
+    def _mint_session(self, m, step_windows):
+        return m.session_store.create(
+            steps=["TURN_LEFT", "TURN_RIGHT"], ttl_s=90.0, correlation_id="c1",
+            transaction_type="sale", transaction_ref="r:b", step_windows=step_windows,
+        )
+
+    def test_soft_mode_logs_anomaly_without_failing_verdict(self, client_enabled):
+        client, m = client_enabled
+        assert m.settings.LIVENESS_TIMING_VALIDATION_ENABLED is False  # sprint default
+
+        yaws = [0.0, 25.0, 0.0, -25.0]
+        m.landmark_detector.analyze.side_effect = [_mock_frame_face(yaw=y) for y in yaws]
+
+        session = self._mint_session(m, self._UNREACHABLE_WINDOWS)
+        frames = _captured_at_frames(4, [0.0, 1.0, 2.0, 3.0])
+        resp = client.post("/liveness/verdict", json={
+            "correlation_id": "c1", "session_id": session.session_id, "transaction_type": "sale",
+            "transaction_ref": "r:b", "frames": frames,
+        })
+        assert resp.status_code == 200
+        assert resp.json()["verdict"] == "live"
+
+    def test_hard_mode_fails_verdict_with_timing_window_violated(self, client_enabled):
+        client, m = client_enabled
+        m.settings.LIVENESS_TIMING_VALIDATION_ENABLED = True
+        try:
+            yaws = [0.0, 25.0, 0.0, -25.0]
+            m.landmark_detector.analyze.side_effect = [_mock_frame_face(yaw=y) for y in yaws]
+
+            session = self._mint_session(m, self._UNREACHABLE_WINDOWS)
+            frames = _captured_at_frames(4, [0.0, 1.0, 2.0, 3.0])
+            resp = client.post("/liveness/verdict", json={
+                "correlation_id": "c1", "session_id": session.session_id, "transaction_type": "sale",
+                "transaction_ref": "r:b", "frames": frames,
+            })
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["verdict"] == "spoof"
+            assert data["reason"] == "TIMING_WINDOW_VIOLATED"
+        finally:
+            m.settings.LIVENESS_TIMING_VALIDATION_ENABLED = False
+
+    def test_reachable_window_passes_in_hard_mode(self, client_enabled):
+        """Regression guard: a window the client DOES honor must not be
+        flagged even with the flag on."""
+        client, m = client_enabled
+        m.settings.LIVENESS_TIMING_VALIDATION_ENABLED = True
+        try:
+            yaws = [0.0, 25.0, 0.0, -25.0]
+            m.landmark_detector.analyze.side_effect = [_mock_frame_face(yaw=y) for y in yaws]
+
+            windows = [
+                {"step": "TURN_LEFT", "min_delay_ms": 0, "max_delay_ms": 10_000},
+                {"step": "TURN_RIGHT", "min_delay_ms": 0, "max_delay_ms": 10_000},
+            ]
+            session = self._mint_session(m, windows)
+            frames = _captured_at_frames(4, [0.0, 1.0, 2.0, 3.0])
+            resp = client.post("/liveness/verdict", json={
+                "correlation_id": "c1", "session_id": session.session_id, "transaction_type": "sale",
+                "transaction_ref": "r:b", "frames": frames,
+            })
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["verdict"] == "live"
+        finally:
+            m.settings.LIVENESS_TIMING_VALIDATION_ENABLED = False
+
+
+class TestQualityCertifiedStartupGuard:
+    """MEDIUM finding (2PAC code review, 2026-07-20): the `LIVENESS_
+    QUALITY_CERTIFIED` guard (app/main.py, right after `LIVENESS_MODEL_
+    VERSION`) is module-level startup code, not a function — the only honest
+    way to exercise it is a real `importlib.reload(app.main)` with env vars
+    set BEFORE the reload (mutating `m.settings` after import does not
+    re-run the guard). Each test restores the environment and reloads again
+    in a `finally` so later tests in this module see the module in its
+    normal (non-certified) state."""
+
+    def test_certified_model_version_mismatch_logs_warning(self, monkeypatch, caplog):
+        import app.main as m
+
+        monkeypatch.setenv("LIVENESS_QUALITY_CERTIFIED", "true")
+        monkeypatch.setenv("LIVENESS_TARGET_APCER", "0.01")
+        monkeypatch.setenv("LIVENESS_TARGET_BPCER", "0.01")
+        monkeypatch.setenv("LIVENESS_CERTIFIED_MODEL_VERSION", "stale-certified-build-mismatch")
+        try:
+            with caplog.at_level(logging.WARNING, logger="app.main"):
+                importlib.reload(m)
+            assert any(
+                "LIVENESS_CERTIFIED_MODEL_VERSION" in rec.message and "does not match" in rec.message
+                for rec in caplog.records
+            )
+        finally:
+            monkeypatch.undo()
+            importlib.reload(m)
+
+    def test_certified_missing_targets_logs_warning(self, monkeypatch, caplog):
+        import app.main as m
+
+        monkeypatch.setenv("LIVENESS_QUALITY_CERTIFIED", "true")
+        monkeypatch.delenv("LIVENESS_TARGET_APCER", raising=False)
+        monkeypatch.delenv("LIVENESS_TARGET_BPCER", raising=False)
+        try:
+            with caplog.at_level(logging.WARNING, logger="app.main"):
+                importlib.reload(m)
+            assert any(
+                "LIVENESS_TARGET_APCER" in rec.message and "not" in rec.message
+                for rec in caplog.records
+            )
+        finally:
+            monkeypatch.undo()
+            importlib.reload(m)
+
+    def test_certified_matching_version_and_targets_no_warning(self, monkeypatch, caplog):
+        import app.main as m
+
+        monkeypatch.setenv("LIVENESS_QUALITY_CERTIFIED", "true")
+        monkeypatch.setenv("LIVENESS_TARGET_APCER", "0.01")
+        monkeypatch.setenv("LIVENESS_TARGET_BPCER", "0.01")
+        monkeypatch.setenv("LIVENESS_CERTIFIED_MODEL_VERSION", m.LIVENESS_MODEL_VERSION)
+        try:
+            with caplog.at_level(logging.WARNING, logger="app.main"):
+                importlib.reload(m)
+            assert not any(
+                "LIVENESS_QUALITY_CERTIFIED" in rec.message for rec in caplog.records
+            )
+        finally:
+            monkeypatch.undo()
+            importlib.reload(m)

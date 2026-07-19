@@ -46,6 +46,20 @@ def _frame(seq: int) -> dict:
     return {"seq": seq, "base64": _make_base64_image(), "captured_at": None}
 
 
+def _yaw_for_step(step: str) -> float:
+    return 25.0 if step == "TURN_LEFT" else -25.0
+
+
+def _yaws_matching_step_order(steps: list[str]) -> list[float]:
+    """See tests/test_liveness_endpoints.py's identical helper — order-by-
+    evidence (Phase 3.1, CHALLENGE_ENTROPY_SPRINT_v1.md §6.1) means a
+    hardcoded TURN_LEFT-then-TURN_RIGHT yaw sequence is flaky now that step
+    order is genuinely randomized (secrets ГСЧ, Фаза 0/2) — build the
+    sequence from the ACTUAL challenge_spec.steps returned instead."""
+    assert len(steps) == 2, "helper assumes today's 2-step pool (TURN_LEFT,TURN_RIGHT)"
+    return [0.0, _yaw_for_step(steps[0]), 0.0, _yaw_for_step(steps[1])]
+
+
 def _mock_frame_face(yaw: float = 0.0):
     """Bbox 100x100 in a 200x200 frame => face_area_ratio=0.25, below the
     default FACE_RATIO_REJECT=0.27 geometry-gate threshold (see
@@ -331,12 +345,18 @@ class TestReplayProtectionLivenessChallenge:
 # ---------------------------------------------------------------------------
 
 class TestReplayProtectionLivenessVerdict:
-    def _verdict_body(self, client, m) -> dict:
+    def _verdict_body(self, client, m, satisfy_challenge: bool = False) -> dict:
         """Mint a real session via /liveness/challenge (replay protection OFF
         at mint time) so the verdict call has a session_id that will pass
-        session lookup once past the replay check under test."""
+        session lookup once past the replay check under test. When
+        `satisfy_challenge=True`, sets `landmark_detector.analyze.side_effect`
+        from the ACTUAL step order the challenge returned (order-by-evidence,
+        Phase 3.1) so the request can reach `verdict=live`."""
         m.settings.REPLAY_PROTECTION_ENABLED = False
         ch = client.post("/liveness/challenge", json=_challenge_body()).json()
+        if satisfy_challenge:
+            yaws = _yaws_matching_step_order(ch["challenge_spec"]["steps"])
+            m.landmark_detector.analyze.side_effect = [_mock_frame_face(yaw=y) for y in yaws]
         frames = [_frame(i) for i in range(m.settings.LIVENESS_MIN_FRAMES)]
         return {
             "correlation_id": "replay-c1", "session_id": ch["session_id"],
@@ -345,9 +365,7 @@ class TestReplayProtectionLivenessVerdict:
 
     def test_valid_timestamp_reaches_live(self, liveness_client):
         client, m = liveness_client
-        yaws = [0.0, 25.0, 0.0, -25.0, 0.0, 0.0]
-        m.landmark_detector.analyze.side_effect = [_mock_frame_face(yaw=y) for y in yaws]
-        body = self._verdict_body(client, m)
+        body = self._verdict_body(client, m, satisfy_challenge=True)
 
         m.settings.REPLAY_PROTECTION_ENABLED = True
         resp = client.post(
@@ -410,9 +428,7 @@ class TestReplayProtectionLivenessVerdict:
 
     def test_disabled_missing_header_still_passes(self, liveness_client):
         client, m = liveness_client
-        yaws = [0.0, 25.0, 0.0, -25.0, 0.0, 0.0]
-        m.landmark_detector.analyze.side_effect = [_mock_frame_face(yaw=y) for y in yaws]
-        body = self._verdict_body(client, m)
+        body = self._verdict_body(client, m, satisfy_challenge=True)
         assert m.settings.REPLAY_PROTECTION_ENABLED is False
         resp = client.post("/liveness/verdict", json=body)
         assert resp.status_code == 200

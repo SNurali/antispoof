@@ -22,6 +22,7 @@ import os
 import time
 import uuid
 from collections import deque
+from datetime import datetime
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -45,7 +46,12 @@ from app.frame_qc import assess_frame
 from app.geometry_check import GeometryCheckResult, check_face_geometry
 from app.identity_consistency import compute_identity_consistency
 from app.liveness import LivenessEngine
-from app.liveness_session import build_session_store, generate_challenge_spec
+from app.liveness_session import (
+    StepWindowDict,
+    build_session_store,
+    generate_challenge_spec,
+    generate_step_windows,
+)
 
 # ---------------------------------------------------------------------------
 # Logging: application + audit
@@ -1096,6 +1102,33 @@ LIVENESS_MODEL_VERSION = (
     "+active_challenge-turn_only_v1"
 )
 
+# Фаза 4 — quality_certified startup guard (CHALLENGE_ENTROPY_SPRINT_v1.md
+# §7.3, требование Рустама §1 п.2: "quality_certified допустим только при
+# числовых целях APCER/BPCER"). LIVENESS_QUALITY_CERTIFIED — РУЧНОЙ флаг
+# (app/config.py, НЕ авто-вычисляемый ни из какой метрики в этом коде) —
+# если он включён, задеплоенный model_version ОБЯЗАН совпадать с тем, на
+# котором был прогнан сертифицирующий CALIBRATION_REPORT.md
+# (LIVENESS_CERTIFIED_MODEL_VERSION) — иначе это "сертифицировали одну
+# версию, задеплоили другую". WARNING-only (не хардфейл), тот же посыл, что
+# и у dev-режима пустого SERVICE_TOKEN выше: quality_certified — это
+# ЗАЯВЛЕНИЕ о качестве, не auth-контроль, который обязан fail-closed —
+# видимого в логах WARNING достаточно, чтобы владелец поймал рассинхрон при
+# ревью, до того как на это заявление будут полагаться ниже по цепочке.
+if settings.LIVENESS_QUALITY_CERTIFIED:
+    if settings.LIVENESS_TARGET_APCER is None or settings.LIVENESS_TARGET_BPCER is None:
+        log.warning(
+            "LIVENESS_QUALITY_CERTIFIED=True but LIVENESS_TARGET_APCER/_BPCER are not "
+            "set — a quality_certified claim without numeric targets is not meaningful "
+            "(CHALLENGE_ENTROPY_SPRINT_v1.md §7.2)."
+        )
+    if settings.LIVENESS_CERTIFIED_MODEL_VERSION != LIVENESS_MODEL_VERSION:
+        log.warning(
+            "LIVENESS_QUALITY_CERTIFIED=True but LIVENESS_CERTIFIED_MODEL_VERSION=%r "
+            "does not match the deployed model_version=%r — certified a different build "
+            "than what is actually running (CHALLENGE_ENTROPY_SPRINT_v1.md §7.3).",
+            settings.LIVENESS_CERTIFIED_MODEL_VERSION, LIVENESS_MODEL_VERSION,
+        )
+
 
 class LivenessChallengeRequest(BaseModel):
     """`transaction_type` is passthrough ONLY here — unlike PadCheckRequest's
@@ -1113,10 +1146,31 @@ class LivenessChallengeRequest(BaseModel):
     )
 
 
+class StepWindow(BaseModel):
+    """Фаза 2 (CHALLENGE_ENTROPY_SPRINT_v1.md §5.3) — НОВОЕ, аддитивное поле
+    контракта. Случайное окно задержки ПОСЛЕ показа предыдущего шага/старта,
+    сэмплированное тем же `secrets`-ГСЧ, что и выбор шагов
+    (app/liveness_session.py::generate_step_windows). Диапазон
+    (`LIVENESS_STEP_DELAY_MIN_MS`/`_MAX_MS`) — ПРЕДВАРИТЕЛЬНЫЙ, не
+    согласован с Рустамом/UX (см. §9 п.2 плана), не считать финальным
+    UX-контрактом. Клиент (мобильное приложение) должен показывать
+    инструкцию к шагу не раньше `min_delay_ms` мс после предыдущего — это
+    межрепозиторийная зависимость на egaz-mobile, не решается только этим
+    сервисом (см. app/config.py::LIVENESS_TIMING_VALIDATION_ENABLED)."""
+    step: str
+    min_delay_ms: int
+    max_delay_ms: int
+
+
 class ChallengeSpec(BaseModel):
     steps: list[str] = Field(..., description="Randomized subset+order, e.g. ['TURN_RIGHT','TURN_LEFT']")
     min_frames: int
     max_frames: int
+    step_windows: list[StepWindow] = Field(
+        default_factory=list,
+        description="НОВОЕ аддитивное поле (Фаза 2) — не ломает старых клиентов, читающих "
+        "только steps/min_frames/max_frames. См. StepWindow docstring.",
+    )
 
 
 class LivenessChallengeResponse(BaseModel):
@@ -1179,9 +1233,19 @@ def _liveness_audit_entry(
     correlation_id: Optional[str], session_id: Optional[str], transaction_type: Optional[str],
     transaction_ref: Optional[str], verdict: str, reason: Optional[str],
     frame_consistency_score: float, processing_ms: float, n_frames_received: int, n_frames_valid: int,
+    soft_validation_anomalies: Optional[dict] = None,
 ) -> None:
     """Metadata-only audit entry — NEVER the frame bytes themselves, same
-    privacy posture as _audit_entry() for /pad/check."""
+    privacy posture as _audit_entry() for /pad/check.
+
+    `soft_validation_anomalies` (Фаза 3.2/3.3, CHALLENGE_ENTROPY_SPRINT_v1.md
+    §6.2/§6.3): additive/optional field — when `LIVENESS_CAPTURED_AT_
+    VALIDATION_ENABLED`/`LIVENESS_TIMING_VALIDATION_ENABLED` are False (the
+    soft-rollout default), a detected `captured_at`/timing anomaly does NOT
+    fail the verdict, but IS written here so the existing audit-log
+    mechanism captures it for later analysis — exactly the "только
+    логируем" behavior the plan calls for, reusing this file/stdout audit
+    trail rather than inventing a new one."""
     entry = {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "endpoint": "liveness_verdict",
@@ -1197,7 +1261,142 @@ def _liveness_audit_entry(
         "model_version": LIVENESS_MODEL_VERSION,
         "processing_ms": round(processing_ms, 1),
     }
+    if soft_validation_anomalies:
+        entry["soft_validation_anomalies"] = soft_validation_anomalies
     audit_log.info(json.dumps(entry, ensure_ascii=False))
+
+
+def _parse_captured_at(raw: Optional[str]) -> Optional[float]:
+    """Best-effort ISO-8601 -> unix-seconds parse for `LivenessFrame.
+    captured_at`. Returns None on anything unparseable (malformed string,
+    None, OR a naive string with no UTC/offset marker — see below) —
+    callers treat that as an anomaly, they do not raise. Handles the
+    trailing 'Z' UTC suffix from the contract's own example
+    (docs/LIVENESS_CONTRACT_v1.md §2, "2026-07-17T14:32:00.100Z") — Python's
+    `datetime.fromisoformat` only accepts 'Z' natively from 3.11+; this repo
+    runs 3.12, but the explicit `.replace("Z", "+00:00")` keeps this correct
+    even if that assumption ever changes.
+
+    ⚠️ NAIVE STRINGS ARE REJECTED, NOT SILENTLY TREATED AS UTC (HIGH finding,
+    MF DOOM code review, 2026-07-20 — decision by the owner/foreman): a
+    naive ISO string (no 'Z', no '+HH:MM'/'-HH:MM' offset) parses fine via
+    `datetime.fromisoformat`, but `datetime.timestamp()` on a naive
+    `datetime` interprets it as LOCAL SERVER TIME (this service runs on
+    egaz-02.uz, UTC+5) — silently treating a client-sent naive timestamp as
+    UTC would be an unstated assumption baked into the code, not a contract
+    guarantee. Since the client's actual timezone for a naive string is
+    unknown (it could mean UTC, it could mean the device's local time, it
+    could mean server-local by coincidence), the only honest behavior is to
+    treat it the SAME as an unparseable string: return None, so the caller
+    reports it as the `UNPARSEABLE` anomaly (soft-log today; hard-reject
+    once `LIVENESS_CAPTURED_AT_VALIDATION_ENABLED=True`). The contract
+    (docs/LIVENESS_CONTRACT_v1.md §7) requires `captured_at` to carry an
+    explicit offset (UTC 'Z' recommended) precisely so this ambiguity never
+    has to be silently resolved here."""
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+    if parsed.tzinfo is None or parsed.tzinfo.utcoffset(parsed) is None:
+        return None
+    return parsed.timestamp()
+
+
+def _validate_captured_at(
+    frames: list["LivenessFrame"], t_instruction_shown: float, expires_at: float,
+) -> Optional[dict]:
+    """Фаза 3.2 (CHALLENGE_ENTROPY_SPRINT_v1.md §6.2) — ПЕРВЫЙ контур
+    (независимый от Laravel'евской M2-валидации, требование Рустама §1 п.3):
+    проверяет окно `[t_instruction_shown, expires_at]` и неубывание по `seq`
+    для `captured_at`.
+
+    Мягкий precondition: `captured_at` остаётся `Optional[str]` в схеме — эта
+    функция запускает проверку, ТОЛЬКО если ВСЕ кадры сессии его прислали
+    (партнёр ещё не подтвердил стабильную отправку на каждом кадре, см.
+    app/config.py::LIVENESS_CAPTURED_AT_VALIDATION_ENABLED) — отсутствие
+    поля НЕ является аномалией в этом инкременте, это ожидаемое переходное
+    состояние, не ошибка.
+
+    Возвращает None, если проверять нечего или всё в порядке; иначе dict с
+    описанием, ЧТО именно не так — используется и для audit-лога (soft),
+    и для reason=CAPTURED_AT_INVALID (hard)."""
+    if not frames or any(f.captured_at is None for f in frames):
+        return None
+
+    ordered = sorted(frames, key=lambda f: f.seq)
+    parsed: list[tuple[int, Optional[float]]] = [(f.seq, _parse_captured_at(f.captured_at)) for f in ordered]
+
+    anomalies: list[dict] = []
+    for seq, ts in parsed:
+        if ts is None:
+            anomalies.append({"seq": seq, "reason": "UNPARSEABLE"})
+            continue
+        if ts < t_instruction_shown or ts > expires_at:
+            anomalies.append({"seq": seq, "captured_at_ts": ts, "reason": "OUT_OF_WINDOW"})
+
+    prev_ts: Optional[float] = None
+    for seq, ts in parsed:
+        if ts is None:
+            continue  # already reported as UNPARSEABLE above, do not double-report as non-monotonic
+        if prev_ts is not None and ts < prev_ts:
+            anomalies.append({"seq": seq, "captured_at_ts": ts, "reason": "NOT_MONOTONIC"})
+        prev_ts = ts
+
+    if not anomalies:
+        return None
+    return {"anomalies": anomalies}
+
+
+def _validate_step_windows(
+    frames: list["LivenessFrame"],
+    step_windows: list[StepWindowDict],
+    step_evidence_seq: dict[str, int],
+    t_instruction_shown: float,
+) -> Optional[dict]:
+    """Фаза 3.3 (CHALLENGE_ENTROPY_SPRINT_v1.md §6.3) — приближённая проверка
+    того, что клиент выдержал окно `[min_delay_ms, max_delay_ms]` (Фаза 2)
+    перед КАЖДЫМ шагом.
+
+    ⚠️ ЭТО ПРОКСИ, не точное измерение: сервер никогда не видит момент, когда
+    клиент реально ПОКАЗАЛ инструкцию — только `captured_at` того кадра,
+    который Layer 2 (`app/active_challenge.py::verify_challenge`,
+    `detail["step_evidence_seq"]`) засчитал доказательством шага. Честная
+    оговорка, а не додуманная точность.
+
+    Тот же мягкий precondition, что и `_validate_captured_at`: запускается,
+    только если `captured_at` присутствует на каждом кадре — иначе делать
+    нечего, возвращает None."""
+    if not frames or any(f.captured_at is None for f in frames):
+        return None
+
+    by_seq = {f.seq: f.captured_at for f in frames}
+    anomalies: list[dict] = []
+    prev_ts = t_instruction_shown
+    for window in step_windows:
+        step = window["step"]
+        seq = step_evidence_seq.get(step)
+        if seq is None or seq not in by_seq:
+            # Step evidence missing entirely — Layer 2's own STEP_NOT_DETECTED
+            # already covers this case, nothing new to say about timing here.
+            continue
+        ts = _parse_captured_at(by_seq[seq])
+        if ts is None:
+            anomalies.append({"step": step, "seq": seq, "reason": "CAPTURED_AT_UNPARSEABLE"})
+            continue
+        delay_ms = (ts - prev_ts) * 1000.0
+        if delay_ms < window["min_delay_ms"] or delay_ms > window["max_delay_ms"]:
+            anomalies.append({
+                "step": step, "seq": seq, "delay_ms": round(delay_ms, 1),
+                "expected_min_ms": window["min_delay_ms"], "expected_max_ms": window["max_delay_ms"],
+                "reason": "OUTSIDE_WINDOW",
+            })
+        prev_ts = ts
+
+    if not anomalies:
+        return None
+    return {"anomalies": anomalies}
 
 
 def _liveness_not_ready_response() -> JSONResponse:
@@ -1226,7 +1425,17 @@ async def liveness_challenge(
         return _liveness_not_ready_response()
 
     pool = [s.strip() for s in settings.LIVENESS_CHALLENGE_STEPS_POOL.split(",") if s.strip()]
-    steps = generate_challenge_spec(pool, settings.LIVENESS_CHALLENGE_STEP_COUNT)
+    steps = generate_challenge_spec(
+        pool, settings.LIVENESS_CHALLENGE_STEP_COUNT_MIN, settings.LIVENESS_CHALLENGE_STEP_COUNT_MAX,
+    )
+    # Фаза 2 (§5.3): окна тайминга сэмплируются ОДИН раз здесь, тем же
+    # secrets-ГСЧ (см. generate_step_windows), и хранятся в сессии — Фаза
+    # 3.3 на /liveness/verdict читает ИМЕННО эту копию (не пересэмплирует),
+    # тот же принцип единственного источника истины, что уже используется
+    # для `steps`.
+    step_windows = generate_step_windows(
+        steps, settings.LIVENESS_STEP_DELAY_MIN_MS, settings.LIVENESS_STEP_DELAY_MAX_MS,
+    )
 
     session = session_store.create(
         steps=steps,
@@ -1234,6 +1443,7 @@ async def liveness_challenge(
         correlation_id=req.correlation_id,
         transaction_type=req.transaction_type,
         transaction_ref=req.transaction_ref,
+        step_windows=step_windows,
     )
 
     log.info(
@@ -1247,6 +1457,7 @@ async def liveness_challenge(
             steps=steps,
             min_frames=settings.LIVENESS_MIN_FRAMES,
             max_frames=settings.LIVENESS_MAX_FRAMES,
+            step_windows=step_windows,
         ),
         t_instruction_shown=session.t_instruction_shown,
         expires_at=session.expires_at,
@@ -1258,6 +1469,11 @@ def _run_liveness_verdict(req: LivenessVerdictRequest) -> LivenessVerdictRespons
     """Synchronous body of POST /liveness/verdict — run via asyncio.wait_for
     with LIVENESS_INFERENCE_TIMEOUT_S from the route handler below."""
     t0 = time.perf_counter()
+    # Фаза 3.2/3.3 soft rollout (CHALLENGE_ENTROPY_SPRINT_v1.md §6.2/§6.3):
+    # accumulates captured_at/timing anomalies that were DETECTED but did not
+    # fail the verdict (flags disabled) — read by `_respond` below so every
+    # response path (success or failure) writes them into the audit log.
+    soft_anomalies: dict = {}
 
     def _respond(verdict: str, reason: Optional[str], *, frame_consistency_score: float = -1.0,
                  best_frame_seq: Optional[int] = None, signals: Optional[dict] = None) -> LivenessVerdictResponse:
@@ -1267,6 +1483,7 @@ def _run_liveness_verdict(req: LivenessVerdictRequest) -> LivenessVerdictRespons
         _liveness_audit_entry(
             req.correlation_id, req.session_id, req.transaction_type, req.transaction_ref,
             verdict, reason, frame_consistency_score, ms,
+            soft_validation_anomalies=soft_anomalies or None,
             n_frames_received=len(req.frames), n_frames_valid=n_valid,
         )
         return LivenessVerdictResponse(
@@ -1301,6 +1518,21 @@ def _run_liveness_verdict(req: LivenessVerdictRequest) -> LivenessVerdictRespons
             "incomplete", "SESSION_CORRELATION_MISMATCH",
             signals={"session_correlation_id": session.correlation_id, "request_correlation_id": req.correlation_id},
         )
+
+    # --- Фаза 3.2 (§6.2): captured_at window + monotonic-by-seq — ПЕРВЫЙ
+    # контур, до Laravel'евской M2-валидации (требование Рустама §1 п.3).
+    # Мягкий rollout: если флаг выключен (дефолт), аномалия ТОЛЬКО
+    # логируется в audit-log (см. soft_anomalies/_respond выше), вердикт не
+    # режется. captured_at отсутствующий — не аномалия в этом инкременте,
+    # см. _validate_captured_at docstring.
+    captured_at_anomaly = _validate_captured_at(req.frames, session.t_instruction_shown, session.expires_at)
+    if captured_at_anomaly is not None:
+        if settings.LIVENESS_CAPTURED_AT_VALIDATION_ENABLED:
+            return _respond(
+                "spoof", "CAPTURED_AT_INVALID",
+                signals={"captured_at_validation": captured_at_anomaly},
+            )
+        soft_anomalies["captured_at"] = captured_at_anomaly
 
     # --- per-frame decode + Layer 0 QC + Layer 0a geometry gate ---
     from app.face_landmarks import LandmarkDetector  # local import, models already loaded at startup
@@ -1384,6 +1616,23 @@ def _run_liveness_verdict(req: LivenessVerdictRequest) -> LivenessVerdictRespons
         if active_result.reason == "NO_FRONTAL_REFERENCE":
             return _respond("incomplete", "NO_FRONTAL_REFERENCE", signals=base_signals)
         return _respond("spoof", "CHALLENGE_FAILED", signals=base_signals)
+
+    # --- Фаза 3.3 (§6.3): step_windows timing — тот же мягкий rollout, тоже
+    # ПРОКСИ-измерение (см. _validate_step_windows docstring про ограничение
+    # точности), зависит от Фазы 2 (session.step_windows) И от Layer 2 уже
+    # отработавшего успешно (step_evidence_seq известен только когда все
+    # шаги найдены).
+    timing_anomaly = _validate_step_windows(
+        req.frames, session.step_windows, active_result.detail.get("step_evidence_seq", {}),
+        session.t_instruction_shown,
+    )
+    if timing_anomaly is not None:
+        if settings.LIVENESS_TIMING_VALIDATION_ENABLED:
+            return _respond(
+                "spoof", "TIMING_WINDOW_VIOLATED",
+                signals={**base_signals, "timing_validation": timing_anomaly},
+            )
+        soft_anomalies["timing"] = timing_anomaly
 
     # --- Layer 3: cross-frame identity consistency (PRIORITY #1 of this
     # increment — see app/identity_consistency.py) ---

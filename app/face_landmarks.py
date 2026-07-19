@@ -115,6 +115,84 @@ def min_eye_aspect_ratio(landmark_68: np.ndarray) -> float:
     return min(right_ear, left_ear)
 
 
+# ---------------------------------------------------------------------------
+# SMILE support (RZA, 2026-07-20, CHALLENGE_ENTROPY_SPRINT_v1.md §4) — a
+# MAR-like (mouth aspect ratio) coefficient from landmark_68's OUTER lip
+# contour points, reusing the same already-loaded landmark_3d_68 model that
+# already backs pose (TURN) and EAR (BLINK). No new model, no new
+# dependency — same pattern as the BLINK section above.
+#
+# INDEX VERIFICATION (done, not assumed) — 2026-07-20, SAME METHOD already
+# used for the eye indices above (see FrameFace.landmark_68 docstring):
+# ran the real buffalo_l landmark_3d_68 model on the SAME real photo
+# (Загрузки/face_id/Flask/sherzod111.jpg) already used for the eye-index
+# check, rendered all 68 points with per-index labels, then rendered a
+# zoomed crop of only indices 48-67. Visually confirmed against the
+# standard dlib/iBUG-300W 68-point layout:
+#   - 48 = left mouth corner, 54 = right mouth corner (outer contour)
+#   - 49-53 = upper outer lip, left-to-right (51 = cupid's-bow apex)
+#   - 55-59 = lower outer lip, right-to-left (57 = lower-lip apex)
+#   - 60-67 = inner lip contour (not used by mouth_aspect_ratio() below)
+# All 20 mouth points (48-67) land exactly on the lip contour in the
+# rendered crop, and a geometric sanity check on the SAME photo confirms
+# the mouth region sits below the eyes/nose and spans ~37% of the face
+# bbox width — consistent with a real mouth, not a mislabeled region.
+# What is NOT verified: a second/third face or a non-frontal pose — this
+# is a single confirmation on a single frontal photo, same scope limitation
+# already disclosed for the eye-index check.
+#
+# THRESHOLD CALIBRATION — separate question from index correctness, and
+# WEAKER than even BLINK's placeholder: EAR's 0.20 cutoff at least traces
+# to a cited literature source (Soukupová & Čech 2016) for a well-studied
+# blink signal. There is no equivalent widely-cited "MAR value = smiling"
+# constant for THIS width/height formulation — smile-detection thresholds
+# in the wild vary by formula and dataset. The ONE real data point measured
+# here is a NEUTRAL (non-smiling) frontal mouth on the same photo above:
+# mouth_aspect_ratio() = 2.56 (width=142.4px corner-to-corner, height=55.6px
+# averaged vertical gap). No real smiling photo was available in this
+# environment to measure the other end of the range. See
+# app/config.py::LIVENESS_MAR_SMILE_MIN for how this single baseline shapes
+# (and limits) the placeholder value.
+# ---------------------------------------------------------------------------
+MOUTH_LEFT_CORNER_IDX: int = 48
+MOUTH_RIGHT_CORNER_IDX: int = 54
+MOUTH_TOP_IDX: tuple[int, int] = (50, 52)     # upper outer lip, left/right of apex
+MOUTH_BOTTOM_IDX: tuple[int, int] = (58, 56)  # lower outer lip, mirrors MOUTH_TOP_IDX
+
+
+def mouth_aspect_ratio(landmark_68: np.ndarray) -> float:
+    """Width/height ratio of the mouth's OUTER contour (48-59) — "ширина/
+    высота рта" per CHALLENGE_ENTROPY_SPRINT_v1.md §4.1's SMILE row.
+    Structurally the same EAR formula (corner-to-corner horizontal distance
+    vs. two averaged vertical gaps), just built from 6 mouth points (48,
+    50, 52, 54, 56, 58) instead of 6 eye points, and with numerator/
+    denominator SWAPPED relative to EAR (EAR = vertical/horizontal so an
+    OPEN eye reads high; here width/height so a WIDENED, flattened smiling
+    mouth is expected to read HIGH, not low — a relaxed/neutral mouth is
+    already fairly wide-flat at rest, see the module docstring above for
+    why that makes calibration harder than BLINK's, not why the formula is
+    wrong).
+
+    width  = ||p48 - p54||           (corner-to-corner)
+    height = mean(||p50-p58||, ||p52-p56||)   (two vertical gaps, mirrored
+             left/right of the cupid's-bow apex, avoiding a single noisy
+             midline measurement)
+
+    Returns 0.0 for a degenerate (near-zero-height) mouth rather than
+    dividing by ~0, same defensive pattern as _single_eye_ratio above."""
+    p48, p50, p52, p54, p56, p58 = (
+        landmark_68[i][:2] for i in (
+            MOUTH_LEFT_CORNER_IDX, MOUTH_TOP_IDX[0], MOUTH_TOP_IDX[1],
+            MOUTH_RIGHT_CORNER_IDX, MOUTH_BOTTOM_IDX[1], MOUTH_BOTTOM_IDX[0],
+        )
+    )
+    width = np.linalg.norm(p48 - p54)
+    height = (np.linalg.norm(p50 - p58) + np.linalg.norm(p52 - p56)) / 2.0
+    if height < 1e-6:
+        return 0.0
+    return float(width / height)
+
+
 class LandmarkDetector:
     """Loads buffalo_l detection+landmark_3d_68 once; analyzes frames on demand."""
 

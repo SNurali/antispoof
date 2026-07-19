@@ -9,6 +9,7 @@ are proven to honor the exact same public contract, plus a couple of
 Redis-specific cases (native TTL expiry, cross-"process" atomicity, backend
 selection/fail-fast).
 """
+import json
 import threading
 import time
 
@@ -141,6 +142,31 @@ class TestRedisSessionStoreSpecifics:
             transaction_type="sale", transaction_ref="req:bal",
         )
         got, err = store_b.consume(session.session_id)
+        assert err is None
+        assert got.session_id == session.session_id
+
+    def test_unknown_future_field_is_ignored_not_a_typeerror(self, store, redis_client):
+        """MEDIUM finding (2PAC code review, 2026-07-20): a session JSON
+        payload with a key the current `ChallengeSession` dataclass does not
+        know about (simulating a NEWER worker having written it during a
+        rolling deploy) must deserialize cleanly via `get()`/`consume()`
+        instead of raising `TypeError: __init__() got an unexpected keyword
+        argument` — see RedisSessionStore._to_session docstring."""
+        session = store.create(
+            steps=["TURN_LEFT"], ttl_s=60.0, correlation_id="c1",
+            transaction_type="sale", transaction_ref="req:bal",
+        )
+        key = store._key(session.session_id)
+        raw = json.loads(redis_client.get(key))
+        raw["a_future_field_this_worker_does_not_know_about"] = "some-value"
+        redis_client.set(key, json.dumps(raw))
+
+        fetched = store.get(session.session_id)
+        assert fetched is not None
+        assert fetched.session_id == session.session_id
+        assert not hasattr(fetched, "a_future_field_this_worker_does_not_know_about")
+
+        got, err = store.consume(session.session_id)
         assert err is None
         assert got.session_id == session.session_id
 
