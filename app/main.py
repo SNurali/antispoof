@@ -40,6 +40,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.active_challenge import verify_challenge
 from app.config import Settings, resolve_device
+from app.dedup_store import build_dedup_store, compute_phash
 from app.document_check import DocumentPhotoChecker
 from app.face_detect import FaceDetector
 from app.frame_qc import assess_frame
@@ -168,6 +169,13 @@ adaface_embedder = None
 # before, so flipping that flag at runtime doesn't need a restart.
 session_store = build_session_store(settings)
 _liveness_models_loaded: bool = False
+
+# Frame-reuse dedup + inspector/abonent fraud-alert store (app/dedup_store.py)
+# — always constructed regardless of DEDUP_ENABLED/DEDUP_EMBEDDING_ALERT_ENABLED
+# /FRAUD_INSPECTOR_ALERT_ENABLED, same "flip the flag without a restart"
+# pattern as session_store above, and so the SQLite file already exists
+# before the first request in any test (see build_dedup_store docstring).
+dedup_store = build_dedup_store(settings)
 
 # Layer 0 document-photo checker — cheap to construct (holds no model
 # weights, just HTTP config), always built regardless of DOCUMENT_CHECK_ENABLED
@@ -815,6 +823,16 @@ class PadCheckRequest(BaseModel):
     )
     transaction_ref: str = Field(..., description="id_request:id_ballon (natural key)")
     face_photo: str = Field(..., description="Base64 JPEG/PNG — same frame as Adliya")
+    # NEW (RZA, 2026-07-20), OPTIONAL — backward compatible, a caller not
+    # sending these fields is unaffected: dedup-by-phash (app/dedup_store.py)
+    # does NOT need them (works on the frame alone), and the inspector/
+    # abonent fraud-pattern alert is a complete no-op when either is absent.
+    # `abonent_kod`/`pinfl` are explicitly OUT per the original PAD_GATE
+    # contract's own transaction_ref wording ("NOT pinfl, NOT abonent_kod")
+    # — an internal numeric/opaque id is expected here, not PII, matching
+    # the existing correlation_id/transaction_ref privacy posture.
+    abonent_id: Optional[str] = Field(None, description="Opaque abonent identifier, for fraud-pattern alerting only")
+    inspector_id: Optional[str] = Field(None, description="Opaque inspector identifier, for fraud-pattern alerting only")
 
 
 class PadCheckResponse(BaseModel):
@@ -934,6 +952,84 @@ async def pad_check(
     _validate_image_size(img_bytes)
     img = _read_image(img_bytes)
     _validate_image_dimensions(img)
+
+    # --- Frame-reuse dedup (HARD BLOCK) — runs FIRST, before the models-ready
+    # check, face detection, or any other gate: this is a pure image-hash
+    # comparison against prior /pad/check frames, independent of whether
+    # models are loaded. See app/dedup_store.py module docstring — built in
+    # direct response to a real production fraud incident (2026-07-20): the
+    # SAME photo accepted for TWO DIFFERENT abonents, 46s apart, one
+    # inspector. DEFAULT DISABLED (settings.DEDUP_ENABLED, app/config.py) —
+    # see that flag's docstring for why (no real duplicate-photo corpus yet
+    # to verify the Hamming threshold against, and flipping the default on
+    # would break the existing test suite's shared fixture image). Zero-cost,
+    # zero-DB-write no-op when disabled.
+    dedup_phash = compute_phash(img)
+    phash_recorded = False
+    if settings.DEDUP_ENABLED:
+        dedup_match = dedup_store.check_and_record_phash(
+            dedup_phash, settings.DEDUP_PHASH_HAMMING_MAX,
+            req.correlation_id, req.transaction_ref, req.abonent_id, req.inspector_id,
+        )
+        phash_recorded = True
+        if dedup_match is not None:
+            ms = round((time.perf_counter() - t0) * 1000, 1)
+            similarity = round(1.0 - dedup_match.hamming_distance / 64.0, 4)
+            dedup_signals = {
+                "dedup_check": {
+                    "phash_match": True,
+                    "hamming_distance": dedup_match.hamming_distance,
+                    "matched_correlation_id": dedup_match.correlation_id,
+                    "matched_transaction_ref": dedup_match.transaction_ref,
+                    "matched_age_s": dedup_match.age_s,
+                }
+            }
+            _audit_entry(
+                req.correlation_id, req.transaction_type, req.transaction_ref,
+                "spoof", similarity, dedup_signals, ms, True, reason="DUPLICATE_PHOTO",
+            )
+            log.warning(
+                "PAD check: correlation=%s verdict=spoof reason=DUPLICATE_PHOTO "
+                "matched_correlation_id=%s matched_transaction_ref=%s hamming=%d ms=%.1f txn=%s",
+                req.correlation_id, dedup_match.correlation_id, dedup_match.transaction_ref,
+                dedup_match.hamming_distance, ms, req.transaction_ref,
+            )
+            return PadCheckResponse(
+                verdict="spoof", reason="DUPLICATE_PHOTO", score=similarity,
+                threshold=round(1.0 - settings.DEDUP_PHASH_HAMMING_MAX / 64.0, 4), face_detected=False,
+                save_frame=True, signals=dedup_signals, model_version=MODEL_VERSION, processing_ms=ms,
+            )
+    # DEDUP_ENABLED=False (or no match found) — continue unchanged.
+    # `dedup_phash`/`phash_recorded` are kept for the AdaFace-embedding-alert
+    # path further below.
+
+    # --- Inspector/abonent fraud-pattern heuristic — SOFT, log-only, NEVER
+    # blocks a verdict. See app/dedup_store.py module docstring §3. Complete
+    # no-op unless the caller sends BOTH new optional fields (backward
+    # compatible — no existing caller sends them today).
+    fraud_signal: dict = {}
+    if settings.FRAUD_INSPECTOR_ALERT_ENABLED and req.abonent_id and req.inspector_id:
+        dedup_store.record_inspector_activity(
+            req.inspector_id, req.abonent_id, req.correlation_id, req.transaction_ref,
+        )
+        fraud_alert = dedup_store.check_inspector_fraud_alert(
+            req.inspector_id, settings.FRAUD_INSPECTOR_WINDOW_S, settings.FRAUD_INSPECTOR_DISTINCT_ABONENT_MAX,
+        )
+        if fraud_alert is not None:
+            fraud_signal = {
+                "fraud_alert": {
+                    "type": "INSPECTOR_MULTI_ABONENT",
+                    "inspector_id": fraud_alert.inspector_id,
+                    "distinct_abonent_count": fraud_alert.distinct_abonent_count,
+                    "window_s": fraud_alert.window_s,
+                    "abonent_ids": fraud_alert.abonent_ids,
+                }
+            }
+            log.warning(
+                "PAD check: FRAUD ALERT inspector_id=%s distinct_abonents=%d window_s=%.0f correlation=%s txn=%s",
+                fraud_alert.inspector_id, fraud_alert.distinct_abonent_count,
+                fraud_alert.window_s, req.correlation_id, req.transaction_ref,
+            )
 
     # Models ready? (service-side failure, not a bad frame — same family as TIMEOUT/INTERNAL_ERROR)
     if not _models_loaded or detector is None or engine is None:
@@ -1057,6 +1153,59 @@ async def pad_check(
     else:
         verdict = "live"
         reason = None
+
+    # --- AdaFace-embedding-based dedup ALERT — NEVER blocks, see
+    # app/dedup_store.py module docstring §2 for why this is deliberately
+    # weaker than the reviewed spec's proposal (a same-person match across
+    # two different transaction_refs is the EXPECTED case for a repeat
+    # customer, not fraud). Requires the Phase-2 SCRFD+AdaFace models
+    # already loaded (LIVENESS_ENDPOINTS_ENABLED) — see
+    # DEDUP_EMBEDDING_ALERT_ENABLED docstring (app/config.py) for the
+    # latency-budget reasoning this is gated on both flags and defaults off.
+    # Any failure here is swallowed — this is a soft alert, never worth
+    # failing the request over.
+    if settings.DEDUP_EMBEDDING_ALERT_ENABLED and settings.LIVENESS_ENDPOINTS_ENABLED \
+            and _liveness_models_loaded and landmark_detector is not None and adaface_embedder is not None:
+        try:
+            from app.face_landmarks import LandmarkDetector
+            face = landmark_detector.analyze(img)
+            if face is not None:
+                aligned = LandmarkDetector.align_112(img, face.kps)
+                embedding = adaface_embedder.embed_aligned(aligned)
+                if not phash_recorded:
+                    # DEDUP_ENABLED=False but the embedding layer still needs
+                    # a row to attach to (and to be matchable by FUTURE
+                    # requests) — record-only, result intentionally
+                    # discarded: this flag alone never triggers the hard
+                    # DUPLICATE_PHOTO block above.
+                    dedup_store.check_and_record_phash(
+                        dedup_phash, settings.DEDUP_PHASH_HAMMING_MAX,
+                        req.correlation_id, req.transaction_ref, req.abonent_id, req.inspector_id,
+                    )
+                    phash_recorded = True
+                dedup_store.record_embedding(req.correlation_id, embedding)
+                embedding_matches = dedup_store.check_embedding_alert(
+                    embedding, settings.DEDUP_EMBEDDING_COSINE_ALERT, req.transaction_ref,
+                    exclude_abonent_id=req.abonent_id,
+                )
+                if embedding_matches:
+                    signal_info = dict(signal_info)
+                    signal_info["dedup_embedding_alert"] = [
+                        {
+                            "correlation_id": m.correlation_id, "transaction_ref": m.transaction_ref,
+                            "abonent_id": m.abonent_id, "inspector_id": m.inspector_id,
+                            "cosine_similarity": m.cosine_similarity, "age_s": m.age_s,
+                        }
+                        for m in embedding_matches
+                    ]
+        except Exception:
+            log.exception(
+                "dedup embedding-alert failed for correlation=%s — continuing without it "
+                "(alert-only, never blocking)", req.correlation_id,
+            )
+
+    if fraud_signal:
+        signal_info = {**signal_info, **fraud_signal}
 
     save_frame = verdict in _save_frame_verdicts
     processing_ms = round((time.perf_counter() - t0) * 1000, 1)

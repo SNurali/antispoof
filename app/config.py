@@ -71,6 +71,20 @@ class Settings(BaseSettings):
     # before they do turns every one of their existing requests into a 401.
     # 50 CENT flips this on only after that is confirmed live, same rollout
     # pattern as TRUST_PROXY_HEADERS above.
+    #
+    # DELIBERATELY LEFT FALSE (RZA, 2026-07-20 fraud-incident hardening
+    # pass): re-checked this specific flag against the most recent status —
+    # docs/plans/HANDOFF-2026-07-18-egaz2-mtls-staging.md (2 days before this
+    # pass) states plainly that egaz-02.uz DNS still does not resolve, mTLS
+    # is NOT deployed, and the partner has NOT yet been sent even the
+    # staging URL/token, let alone confirmed sending X-Request-Timestamp.
+    # Flipping this default to True now would 401 every legitimate
+    # money-path request the moment this code reaches prod — the exact
+    # outage this rollout gate exists to prevent. The mechanism itself is
+    # fully implemented and tested (tests/test_replay_protection.py, 218
+    # green as of the 07-18 handoff, unaffected by this pass) — only the
+    # DEFAULT is intentionally unchanged pending the partner's confirmation
+    # this handoff document says is still outstanding.
     REPLAY_PROTECTION_ENABLED: bool = False
     # Clock-skew + network/retry tolerance, in seconds. 120s is deliberately
     # generous — wide enough to absorb NTP drift and a slow mobile network
@@ -460,6 +474,88 @@ class Settings(BaseSettings):
     # of that is a real architecture risk to escalate (see IR-101 note on
     # ADAFACE_ONNX_PATH above), not something to quietly accept.
     LIVENESS_INFERENCE_TIMEOUT_S: float = 8.0
+
+    # ------------------------------------------------------------------
+    # Frame-reuse dedup + inspector/abonent fraud-pattern alerting
+    # (RZA, 2026-07-20) — see app/dedup_store.py module docstring for the
+    # full design. Built in direct response to a real production fraud
+    # incident: the SAME photo accepted for TWO DIFFERENT abonents on one
+    # sale request, 46s apart, same inspector — the stateless service had
+    # nothing to catch that with.
+    #
+    # DEFAULT DISABLED (unlike GEOMETRY_CHECK_ENABLED, which had 14 real
+    # calibration samples before defaulting on): this repo has ZERO real
+    # duplicate-photo pairs from egaz-02 traffic to verify DEDUP_PHASH_
+    # HAMMING_MAX against — the value below is the literature default for
+    # "very likely the same source image" (imagehash-family pHash
+    # comparisons), not measured on this camera/compression pipeline. It is
+    # ALSO the reason the existing test suite (tests/test_pad_check.py and
+    # friends) reuses one fixed synthetic image across many tests with
+    # DIFFERENT transaction_ref values — flipping this on by default would
+    # make those tests fail on an unrelated PR, not just the ones testing
+    # dedup. Recommend: enable after this report is reviewed AND after
+    # collecting a small known-duplicate vs known-different photo-pair
+    # sample from real traffic to sanity-check the threshold, same
+    # "не занижай FAR" bar every other threshold in this file is held to.
+    DEDUP_ENABLED: bool = False
+    # Hamming distance (out of 64 bits) below which two pHashes count as
+    # "the same photo" for the HARD BLOCK path. UNCALIBRATED on this
+    # service's real frames (see above) — 4 is the literature default.
+    DEDUP_PHASH_HAMMING_MAX: int = 4
+    # Retention window for both the pHash dedup table and the
+    # inspector-activity table (see app/dedup_store.py). 90 days chosen to
+    # match the task's own retention ask; NOT independently derived from a
+    # documented fraud-investigation SLA — open question for the owner.
+    DEDUP_TTL_DAYS: float = 90.0
+    # SQLite file path. Lives under MODEL_DIR (like ADAFACE_ONNX_PATH) —
+    # deliberately NOT a bare filename in the repo root, and deliberately a
+    # real on-disk file (not ":memory:") in production so the 90-day window
+    # survives a service restart/deploy; tests override this to ":memory:"
+    # via the DEDUP_DB_PATH env var (see tests/test_dedup.py) for isolation.
+    DEDUP_DB_PATH: Path = Path(__file__).resolve().parent.parent / "models" / "dedup_store.sqlite3"
+
+    # AdaFace-embedding-based dedup — ALERT ONLY, never blocks (see
+    # app/dedup_store.py module docstring §2 for why this is deliberately
+    # WEAKER than the reviewed spec's original "reject on face match"
+    # proposal: the same real customer legitimately buys gas again on a
+    # different day, so a same-person match across two different
+    # transaction_ref's is the EXPECTED case, not fraud).
+    #
+    # DEFAULT DISABLED, and gated on LIVENESS_ENDPOINTS_ENABLED being True
+    # too (app/main.py's call site) — computing an AdaFace embedding on the
+    # /pad/check path requires the SAME SCRFD+landmark_3d_68 detection
+    # (~100-160ms CPU) + AdaFace IR-101 embedding (~342-524ms CPU, see
+    # ADAFACE_ONNX_PATH docstring above) already measured as expensive for
+    # the ACTIVE-liveness service's own 8s budget — /pad/check's budget is
+    # 2.0s (INFERENCE_TIMEOUT_S, app/main.py), tighter than that. Enabling
+    # this without a lighter checkpoint (IR-18/50, same open item as
+    # ADAFACE_ONNX_PATH) or GPU risks pushing real requests into TIMEOUT.
+    # Left implemented and tested, but NOT wired to run by default.
+    DEDUP_EMBEDDING_ALERT_ENABLED: bool = False
+    # UNCALIBRATED literature placeholder — same "no same-domain corpus"
+    # caveat as IDENTITY_MIN above, kept at the same working-hypothesis
+    # value rather than inventing a different number.
+    DEDUP_EMBEDDING_COSINE_ALERT: float = 0.40
+
+    # Inspector/abonent fraud-pattern heuristic — SOFT signal only, never
+    # blocks a verdict (Laravel's own hard/soft fraud-escalation contract
+    # decides what to do with it downstream). Requires the CALLER to send
+    # the new optional `abonent_id`/`inspector_id` fields on /pad/check — a
+    # complete no-op for any caller that does not send them (today: every
+    # existing caller), so this is safe to default ON unlike DEDUP_ENABLED
+    # above — there is no existing traffic pattern it could disrupt.
+    FRAUD_INSPECTOR_ALERT_ENABLED: bool = True
+    # Sliding window (seconds) the distinct-abonent count is measured over.
+    # 300s (5 min) chosen to comfortably cover the actual incident's 46s gap
+    # with margin — NOT derived from a documented normal-inspector-workflow
+    # baseline (how many DIFFERENT abonents a legitimate inspector visits in
+    # 5 minutes during a real route) because no such baseline exists yet in
+    # this repo; open question for the owner/50 CENT once real audit-log
+    # volume exists to check this against.
+    FRAUD_INSPECTOR_WINDOW_S: float = 300.0
+    # Same caveat: 3 distinct abonents in the window is a guess at "unusual",
+    # not a measured baseline.
+    FRAUD_INSPECTOR_DISTINCT_ABONENT_MAX: int = 3
 
     model_config = {"env_prefix": ""}
 

@@ -40,3 +40,10 @@ ENV/
 
 # --- Local-only manual browser test page (dev tool, not needed in prod) ---
 testpage/
+
+# --- Runtime dedup store DB (app/dedup_store.py) — generated at runtime,
+# never checked in; DEDUP_ENABLED defaults False so this is normally empty,
+# but a local dev run with it flipped on should not pollute git status. ---
+models/dedup_store.sqlite3
+*.sqlite3
+*.sqlite3-journal
