@@ -185,6 +185,51 @@ class Settings(BaseSettings):
     # this sits between.
     MIN_FACE_SHARPNESS_224: float = 60.0
 
+    # Layer 0e — image resolution/weight pre-filter (RZA, 2026-07-21, owner
+    # request). See app/resolution_check.py module docstring for the full
+    # rationale (a 199-file Telegram-preview calibration dataset turned out
+    # unusable — every file re-encoded to <=800px/~59KB average, hiding the
+    # edge-smear signal blur_check.py depends on) and the numbers behind
+    # every threshold below. Dependency-free (pure arithmetic on width/
+    # height/byte-size, no model, no bbox — unlike the sharpness/pose gates
+    # this one does not even need a detected face) but DEFAULT DISABLED:
+    # the client-side numbers below are read from egaz-mobile source
+    # (FaceFrameProcessor.kt/FaceCaptureGeometry.kt), NOT measured on a real
+    # captured JPEG from a real device — CameraX's actual crop behavior for
+    # ImageCapture inside a ViewPort+UseCaseGroup on every device model is a
+    # live-device concern this repo cannot verify. Enable only after
+    # confirming real /pad/check traffic (or a manual device capture) clears
+    # these thresholds — flipping this on blind risks rejecting genuine
+    # client frames (FRR), the same "не занижай FAR ценой FRR" bar in
+    # reverse. Also: this repo's existing /verify, /verify_batch,
+    # /spoof-server, /pad/check test suites reuse a shared 200x200 synthetic
+    # fixture image (`_make_test_image`/`_make_base64_image` in
+    # tests/test_pad_check.py and friends) — well below every threshold
+    # below — the SAME "would break the existing test suite's shared
+    # fixture on an unrelated PR" reasoning FRAME_SHARPNESS_CHECK_ENABLED's
+    # own docstring already flags for its 200x200 flat-fixture overlap.
+    RESOLUTION_CHECK_ENABLED: bool = False
+    # Shorter of (width, height), in pixels. 700 sits ~12% above the
+    # Telegram-preview dataset's observed max (623px, n=199) and ~27% below
+    # the client's expected ~960px short side (3:4 aspect, 1280px long side
+    # cap) — see module docstring for the full derivation and the 16:9
+    # worst-case (720px) margin this was deliberately picked to survive.
+    MIN_IMAGE_MIN_SIDE_PX: int = 700
+    # Total megapixels (width * height / 1e6). 0.55 sits ~10% above the
+    # Telegram-preview dataset's observed max (0.498MP) and ~55% below the
+    # client's expected ~1.23MP. Kept alongside MIN_IMAGE_MIN_SIDE_PX (not
+    # instead of it) — the two catch different aspect-ratio edge cases, see
+    # module docstring.
+    MIN_IMAGE_MEGAPIXELS: float = 0.55
+    # Raw upload byte size floor. DELIBERATELY LOW (15KB) — NOT tuned
+    # against the Telegram dataset's own weight range (9.7-128KB): the
+    # client's own TARGET_BYTES=350KB in FaceFrameProcessor.kt is an UPPER
+    # bound its binary search compresses down to, not a floor, and a real
+    # low-detail/plain-background client frame can legitimately encode well
+    # under 100KB. This constant exists only as a corrupted/near-blank-image
+    # floor — see module docstring limitation #2 before ever raising it.
+    MIN_IMAGE_BYTES: int = 15 * 1024
+
     # Layer 0d — face-angle (yaw/pitch) gate (RZA, 2026-07-21). See
     # app/pose_check.py module docstring for the full rationale and
     # calibration numbers (s001, n=1 subject).

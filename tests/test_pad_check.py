@@ -855,3 +855,164 @@ class TestNoFrameStorage:
         assert audit_records, "expected an audit log entry to be written"
         assert all(b64_photo not in rec for rec in audit_records), "audit log must not contain the raw base64 frame"
         assert b64_photo not in resp.text, "response must not echo back the raw frame"
+
+
+# ---------------------------------------------------------------------------
+# POST /pad/check — Layer 0e image resolution/weight gate (RZA, 2026-07-21)
+# ---------------------------------------------------------------------------
+
+def _make_client_shaped_base64_image() -> str:
+    """~960x1280 (3:4), the client's expected real capture shape per
+    egaz-mobile/core/core-faceid-capture — see app/resolution_check.py's
+    module docstring for the derivation. Textured (not flat), so its JPEG
+    weight is realistic rather than an artificially-compressible flat fill."""
+    import cv2
+    import numpy as np
+    rng = np.random.default_rng(7)
+    img = np.zeros((1280, 960, 3), dtype=np.uint8)
+    cv2.circle(img, (480, 640), 300, (200, 180, 160), -1)
+    noise = rng.integers(-30, 30, size=img.shape, dtype=np.int16)
+    img = np.clip(img.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+    _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    return base64.b64encode(buf.tobytes()).decode()
+
+
+class TestPadCheckResolutionLayer:
+    def test_disabled_by_default_never_blocks_small_frame(self, client):
+        """RESOLUTION_CHECK_ENABLED defaults to False (see app/config.py —
+        the existing test suite's shared 200x200 fixture is itself below
+        every threshold this gate would use) — a small frame must still
+        fall through to passive-PAD unchanged."""
+        resp = client.post("/pad/check", json={
+            "correlation_id": "test-reso-disabled",
+            "transaction_type": "sale",
+            "transaction_ref": "req:bal",
+            "face_photo": _make_base64_image(),  # 200x200, below every threshold
+        })
+        assert resp.status_code == 200
+        assert resp.json()["verdict"] == "live"  # mocked passive-PAD, gate never ran
+
+    def test_enabled_small_frame_short_circuits_to_low_quality(self, client):
+        """RESOLUTION_CHECK_ENABLED=True + a below-threshold 200x200 frame
+        (well under MIN_IMAGE_MIN_SIDE_PX=700 / MIN_IMAGE_MEGAPIXELS=0.55) =>
+        verdict=low_quality, reason=LOW_RESOLUTION, WITHOUT ever calling
+        passive-PAD (engine.predict) OR even face detection — mirrors
+        TestPadCheckSharpnessLayer's pattern."""
+        import app.main as m
+
+        m.settings.RESOLUTION_CHECK_ENABLED = True
+        try:
+            with patch.object(m.engine, "predict") as mock_predict, \
+                 patch.object(m.detector, "detect") as mock_detect:
+                resp = client.post("/pad/check", json={
+                    "correlation_id": "test-reso-blocked",
+                    "transaction_type": "sale",
+                    "transaction_ref": "req:bal",
+                    "face_photo": _make_base64_image(),
+                })
+            mock_predict.assert_not_called()
+            mock_detect.assert_not_called()  # bbox-independent — must not even detect
+        finally:
+            m.settings.RESOLUTION_CHECK_ENABLED = False
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["verdict"] == "low_quality"
+        assert data["reason"] == "LOW_RESOLUTION"
+        assert data["save_frame"] is False
+        assert data["face_detected"] is False
+        assert "resolution_check" in data["signals"]
+        assert data["signals"]["resolution_check"]["min_side"] == 200
+
+    def test_enabled_client_shaped_frame_falls_through_to_passive_pad(self, client):
+        """A ~960x1280 frame (the client's expected real capture shape) must
+        NOT be rejected by this layer even when enabled — passive-PAD's
+        mocked verdict is what's returned. This is the core FRR guardrail
+        for this gate: it must never reject the shape our own app sends."""
+        import app.main as m
+
+        m.settings.RESOLUTION_CHECK_ENABLED = True
+        try:
+            resp = client.post("/pad/check", json={
+                "correlation_id": "test-reso-pass",
+                "transaction_type": "sale",
+                "transaction_ref": "req:bal",
+                "face_photo": _make_client_shaped_base64_image(),
+            })
+        finally:
+            m.settings.RESOLUTION_CHECK_ENABLED = False
+
+        assert resp.status_code == 200
+        assert resp.json()["verdict"] == "live"
+
+    def test_enabled_telegram_preview_shaped_frame_blocked(self, client):
+        """450x800, the single most common shape in the real 199-file
+        Telegram-preview calibration dataset (162/199 files) — must be
+        rejected when the gate is enabled."""
+        import cv2
+        import numpy as np
+        img = np.zeros((800, 450, 3), dtype=np.uint8)
+        cv2.circle(img, (225, 400), 150, (200, 180, 160), -1)
+        _, buf = cv2.imencode(".jpg", img)
+        b64 = base64.b64encode(buf.tobytes()).decode()
+
+        import app.main as m
+        m.settings.RESOLUTION_CHECK_ENABLED = True
+        try:
+            resp = client.post("/pad/check", json={
+                "correlation_id": "test-reso-telegram-shape",
+                "transaction_type": "sale",
+                "transaction_ref": "req:bal",
+                "face_photo": b64,
+            })
+        finally:
+            m.settings.RESOLUTION_CHECK_ENABLED = False
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["verdict"] == "low_quality"
+        assert data["reason"] == "LOW_RESOLUTION"
+
+    def test_min_side_boundary_at_threshold_not_flagged(self, client):
+        """700px min side (== MIN_IMAGE_MIN_SIDE_PX) on an otherwise
+        client-shaped frame must NOT be rejected — strict `<`, not `<=`."""
+        import cv2
+        import numpy as np
+        rng = np.random.default_rng(3)
+        img = np.zeros((1280, 700, 3), dtype=np.uint8)
+        cv2.circle(img, (350, 640), 250, (200, 180, 160), -1)
+        noise = rng.integers(-30, 30, size=img.shape, dtype=np.int16)
+        img = np.clip(img.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+        _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        b64 = base64.b64encode(buf.tobytes()).decode()
+
+        import app.main as m
+        m.settings.RESOLUTION_CHECK_ENABLED = True
+        try:
+            resp = client.post("/pad/check", json={
+                "correlation_id": "test-reso-boundary",
+                "transaction_type": "sale",
+                "transaction_ref": "req:bal",
+                "face_photo": b64,
+            })
+        finally:
+            m.settings.RESOLUTION_CHECK_ENABLED = False
+
+        assert resp.status_code == 200
+        assert resp.json()["verdict"] == "live"
+
+    def test_disabled_flag_skips_layer_even_with_tiny_frame(self, client):
+        """RESOLUTION_CHECK_ENABLED=False (explicit) => tiny frames must NOT
+        be rejected by this layer; passive-PAD alone decides — symmetric to
+        TestPadCheckGeometryLayer's disabled-flag test."""
+        import app.main as m
+
+        m.settings.RESOLUTION_CHECK_ENABLED = False
+        resp = client.post("/pad/check", json={
+            "correlation_id": "test-reso-explicit-disabled",
+            "transaction_type": "sale",
+            "transaction_ref": "req:bal",
+            "face_photo": _make_base64_image(),
+        })
+        assert resp.status_code == 200
+        assert resp.json()["verdict"] == "live"

@@ -332,3 +332,66 @@ class TestSpoofServerResponseShape:
         data = resp.json()
         assert "reason" in data
         assert data["reason"] == "PASSIVE_PAD_SPOOF"
+
+
+# ---------------------------------------------------------------------------
+# POST /spoof-server — Layer 0e resolution gate + verdict-mapping fix (RZA, 2026-07-21)
+# ---------------------------------------------------------------------------
+
+class TestSpoofServerResolutionLayer:
+    def test_disabled_by_default_never_blocks_small_frame(self, client):
+        """RESOLUTION_CHECK_ENABLED defaults to False — a small (200x200)
+        frame must still fall through to passive-PAD unchanged."""
+        resp = client.post("/spoof-server", json={"photo": _make_base64_image()})
+        assert resp.status_code == 200
+        assert resp.json()["verdict"] == "live"
+
+    def test_enabled_small_frame_maps_to_low_resolution(self, client):
+        """RESOLUTION_CHECK_ENABLED=True + a below-threshold frame =>
+        verdict=low_quality, reason=LOW_RESOLUTION, is_spoof=1 (backward
+        compat). This exercises app/main.py's explicit per-label verdict
+        mapping (label='low_quality' -> reason='LOW_RESOLUTION'), NOT the
+        generic score-vs-LIVENESS_THRESHOLD fallback — see the mapping
+        block's own comment for why that fallback would have been wrong
+        here (megapixels can sit above 0.5 while still below
+        MIN_IMAGE_MEGAPIXELS=0.55)."""
+        import app.main as m
+        m.settings.RESOLUTION_CHECK_ENABLED = True
+        try:
+            resp = client.post("/spoof-server", json={"photo": _make_base64_image()})
+        finally:
+            m.settings.RESOLUTION_CHECK_ENABLED = False
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["verdict"] == "low_quality"
+        assert data["reason"] == "LOW_RESOLUTION"
+        assert data["is_spoof"] == 1
+
+
+class TestSpoofServerBlurryVerdictMappingFix:
+    def test_blurry_label_maps_to_low_quality_not_live(self, client):
+        """REGRESSION (found + fixed 2026-07-21 while wiring in the
+        resolution gate): `check_face_sharpness`'s 'blurry' label carries
+        `score=sharpness` (a Laplacian-variance value, e.g. tens-to-hundreds
+        — NOT a [0..1] confidence), which is virtually never
+        `< settings.LIVENESS_THRESHOLD` (0.5). The OLD mapping in this
+        endpoint fell through to the generic `elif score < threshold`
+        branch for any label it didn't explicitly recognize, so a
+        genuinely-fired blur-gate hit would have silently become
+        verdict='live' the moment FRAME_SHARPNESS_CHECK_ENABLED is turned
+        on — defeating that gate specifically in THIS endpoint. Now an
+        explicit branch handles it."""
+        import app.main as m
+
+        m.settings.FRAME_SHARPNESS_CHECK_ENABLED = True
+        try:
+            resp = client.post("/spoof-server", json={"photo": _make_base64_image()})
+        finally:
+            m.settings.FRAME_SHARPNESS_CHECK_ENABLED = False
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["verdict"] == "low_quality", \
+            "blurry-gate hit must map to low_quality, not silently fall through to live"
+        assert data["reason"] == "BLURRY"

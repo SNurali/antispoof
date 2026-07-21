@@ -48,6 +48,7 @@ from app.frame_qc import assess_frame
 from app.geometry_check import GeometryCheckResult, check_face_geometry
 from app.identity_consistency import compute_identity_consistency
 from app.pose_check import PoseCheckResult, check_face_pose
+from app.resolution_check import ResolutionCheckResult, check_image_resolution
 from app.liveness import LivenessEngine
 from app.liveness_session import (
     StepWindowDict,
@@ -528,6 +529,54 @@ def _validate_image_dimensions(img: np.ndarray) -> None:
         )
 
 
+def _run_resolution_gate(image_bgr: np.ndarray, byte_size: int) -> Optional[ResolutionCheckResult]:
+    """Layer 0e — shared image resolution/weight gate (RZA, 2026-07-21).
+
+    Unlike every other Layer 0 gate in this file, this one needs NO detected
+    face/bbox at all — pure arithmetic on the decoded image's width/height
+    and the raw upload's byte size — so callers should run it as early as
+    possible (right after decode + `_validate_image_dimensions`), before
+    face detection, to reject a too-small/re-compressed frame at the lowest
+    possible cost. See app/resolution_check.py for the full rationale
+    (a 199-file Telegram-preview calibration dataset that was unusable
+    because every file was a re-encoded thumbnail) and the numbers behind
+    every threshold.
+
+    Returns the `ResolutionCheckResult` when the gate fired (caller should
+    short-circuit to its own low_quality response), or `None` when disabled,
+    did not run (bad input — should not happen with a real decoded image),
+    or did not flag the frame (caller falls through unchanged). Never
+    raises.
+    """
+    if not settings.RESOLUTION_CHECK_ENABLED:
+        return None
+    h, w = image_bgr.shape[:2]
+    result = check_image_resolution(
+        w, h, byte_size,
+        settings.MIN_IMAGE_MIN_SIDE_PX, settings.MIN_IMAGE_MEGAPIXELS, settings.MIN_IMAGE_BYTES,
+    )
+    if result.ran and result.is_low_resolution:
+        return result
+    return None
+
+
+def _resolution_signals(result: ResolutionCheckResult) -> dict:
+    """Build the `signals` sub-dict shape used across endpoints for a resolution-gate hit."""
+    return {
+        "resolution_check": {
+            "width": result.width,
+            "height": result.height,
+            "min_side": result.min_side,
+            "megapixels": result.megapixels,
+            "byte_size": result.byte_size,
+            "fired": result.reason,
+            "min_side_threshold": settings.MIN_IMAGE_MIN_SIDE_PX,
+            "megapixels_threshold": settings.MIN_IMAGE_MEGAPIXELS,
+            "bytes_threshold": settings.MIN_IMAGE_BYTES,
+        }
+    }
+
+
 def _run_geometry_gate(bbox: list[int], image_bgr: np.ndarray) -> Optional[GeometryCheckResult]:
     """Layer 0a — shared face-to-frame geometry gate.
 
@@ -639,8 +688,26 @@ def _pose_signals(result: PoseCheckResult) -> dict:
     }
 
 
-def _run_single(image_bgr: np.ndarray) -> dict:
-    """Detect face + (Layer 0a geometry gate) + predict liveness for a single image."""
+def _run_single(image_bgr: np.ndarray, byte_size: int = 0) -> dict:
+    """Detect face + (Layer 0a geometry gate) + predict liveness for a single image.
+
+    `byte_size` (raw upload size in bytes, 0 if the caller has none to give —
+    e.g. a not-yet-updated call site) feeds the Layer 0e resolution/weight
+    gate below; a caller passing 0 with `RESOLUTION_CHECK_ENABLED=True` would
+    always fail the byte-size sub-check, so every call site in this file
+    passes the real `len(...)` of the decoded bytes — see app/resolution_check.py.
+    """
+    reso_result = _run_resolution_gate(image_bgr, byte_size)
+    if reso_result is not None:
+        return {
+            "is_real": False,
+            "label": "low_quality",
+            "score": reso_result.megapixels,
+            "threshold": settings.MIN_IMAGE_MEGAPIXELS,
+            "face_detected": False,
+            "signals": _resolution_signals(reso_result),
+        }
+
     bbox = detector.detect(image_bgr)
     if bbox is None:
         return {
@@ -728,7 +795,7 @@ async def verify(image: UploadFile = File(...)) -> dict:
     _validate_image_dimensions(img)
 
     t0 = time.perf_counter()
-    result = _run_single(img)
+    result = _run_single(img, len(data))
     result["processing_ms"] = round((time.perf_counter() - t0) * 1000, 1)
     return result
 
@@ -743,31 +810,47 @@ async def verify_batch(images: list[UploadFile] = File(...)) -> dict:
 
     t0 = time.perf_counter()
 
-    decoded: list[tuple[np.ndarray, Optional[list[int]], str]] = []
+    decoded: list[tuple[np.ndarray, Optional[list[int]], str, Optional[ResolutionCheckResult]]] = []
     for upload in images:
         if not upload.content_type or not upload.content_type.startswith("image/"):
-            decoded.append((np.zeros((1, 1, 3), dtype=np.uint8), None, "not an image"))
+            decoded.append((np.zeros((1, 1, 3), dtype=np.uint8), None, "not an image", None))
             continue
         data = await upload.read()
         if not data:
-            decoded.append((np.zeros((1, 1, 3), dtype=np.uint8), None, "empty file"))
+            decoded.append((np.zeros((1, 1, 3), dtype=np.uint8), None, "empty file", None))
             continue
         _validate_image_size(data)
         img = _read_image(data)
         _validate_image_dimensions(img)
+        # Layer 0e resolution/weight gate — bbox-independent (see
+        # app/resolution_check.py), so it runs BEFORE face detection here to
+        # skip that cost entirely on a frame this gate would reject anyway.
+        reso_result = _run_resolution_gate(img, len(data))
+        if reso_result is not None:
+            decoded.append((img, None, "", reso_result))
+            continue
         bbox = detector.detect(img)
-        decoded.append((img, bbox, ""))
+        decoded.append((img, bbox, "", None))
 
     crops: list[np.ndarray] = []
     crop_face_px: list[int] = []
     crop_indices: list[int] = []
     results: list[dict] = [{}] * len(decoded)
 
-    for i, (img, bbox, err) in enumerate(decoded):
+    for i, (img, bbox, err, reso_result) in enumerate(decoded):
         if err:
             results[i] = {"is_real": False, "label": "no_face", "score": 0.0,
                            "threshold": settings.LIVENESS_THRESHOLD,
                            "face_detected": False, "error": err}
+        elif reso_result is not None:
+            results[i] = {
+                "is_real": False,
+                "label": "low_quality",
+                "score": reso_result.megapixels,
+                "threshold": settings.MIN_IMAGE_MEGAPIXELS,
+                "face_detected": False,
+                "signals": _resolution_signals(reso_result),
+            }
         elif bbox is None:
             results[i] = {"is_real": False, "label": "no_face", "score": 0.0,
                            "threshold": settings.LIVENESS_THRESHOLD,
@@ -865,7 +948,7 @@ async def spoof_server(req: SpoofRequest) -> SpoofServerResponse:
             reason="INTERNAL_ERROR",
         )
 
-    result = _run_single(img)
+    result = _run_single(img, len(img_bytes))
 
     elapsed = round(time.perf_counter() - t0, 3)
     is_spoof = 0 if result["is_real"] else 1
@@ -877,8 +960,22 @@ async def spoof_server(req: SpoofRequest) -> SpoofServerResponse:
     label = result.get("label", "unknown")
     score = result.get("score", 0.0)
 
-    # Explicit three-branch verdict mapping (NOT via is_real boolean).
-    # This prevents the regression where label="real" + score<threshold → spoof.
+    # Explicit per-label verdict mapping (NOT via is_real boolean, and NOT a
+    # bare score-vs-threshold fallback for every gate label — see fix below).
+    # This prevents the regression where label="real" + score<threshold →
+    # spoof. RZA, 2026-07-21: also fixes a real pre-existing bug this pass
+    # found while wiring in the new "low_quality" (resolution-gate) label —
+    # `check_face_sharpness`'s "blurry" label carries `score=sharpness`
+    # (a Laplacian-variance value, typically tens-to-hundreds, e.g. 45.0),
+    # which is virtually NEVER `< settings.LIVENESS_THRESHOLD` (0.5) — the
+    # OLD fallback-only mapping below would have silently fallen through to
+    # `verdict="live"` for a blur-gate hit the moment FRAME_SHARPNESS_CHECK_
+    # ENABLED is turned on, defeating that gate specifically in THIS endpoint
+    # (currently dormant/unexercised only because that flag still defaults
+    # False). Same class of bug would have hit the NEW resolution gate's
+    # "low_quality" label too (`score=megapixels`, can sit above 0.5 while
+    # still below MIN_IMAGE_MEGAPIXELS) — both are now explicit branches
+    # instead of relying on the numeric fallback.
     if label == "document_photo":
         verdict = "spoof"
         reason: Optional[str] = "DOCUMENT_PHOTO"
@@ -888,8 +985,19 @@ async def spoof_server(req: SpoofRequest) -> SpoofServerResponse:
     elif label == "spoof":
         verdict = "spoof"
         reason = "PASSIVE_PAD_SPOOF"
+    elif label == "blurry":
+        verdict = "low_quality"
+        reason = "BLURRY"
+    elif label == "low_quality":
+        # Layer 0e resolution/weight gate (app/resolution_check.py) — see
+        # _run_single's own low_quality branch.
+        verdict = "low_quality"
+        reason = "LOW_RESOLUTION"
     elif score < settings.LIVENESS_THRESHOLD:
-        # Real face but low score (bad lighting, occlusion, etc.) → low quality
+        # Real face but low passive-PAD score (bad lighting, occlusion,
+        # etc.) → low quality. Only reached for labels NOT already handled
+        # above, so this numeric comparison never sees a non-passive-PAD
+        # score again.
         verdict = "low_quality"
         reason = "LOW_QUALITY"
     else:
@@ -935,8 +1043,8 @@ class PadCheckResponse(BaseModel):
     reason: Optional[str] = Field(
         None,
         description=(
-            "PASSIVE_PAD_SPOOF | DOCUMENT_PHOTO | BLURRY | OFF_ANGLE | DUPLICATE_PHOTO | "
-            "NO_FACE | LOW_QUALITY | TIMEOUT | INTERNAL_ERROR | null"
+            "PASSIVE_PAD_SPOOF | DOCUMENT_PHOTO | BLURRY | OFF_ANGLE | LOW_RESOLUTION | "
+            "DUPLICATE_PHOTO | NO_FACE | LOW_QUALITY | TIMEOUT | INTERNAL_ERROR | null"
         ),
     )
     score: float = Field(..., description="Confidence score [0..1]")
@@ -1050,11 +1158,40 @@ async def pad_check(
     img = _read_image(img_bytes)
     _validate_image_dimensions(img)
 
-    # --- Frame-reuse dedup (HARD BLOCK) — runs FIRST, before the models-ready
-    # check, face detection, or any other gate: this is a pure image-hash
-    # comparison against prior /pad/check frames, independent of whether
-    # models are loaded. See app/dedup_store.py module docstring — built in
-    # direct response to a real production fraud incident (2026-07-20): the
+    # Layer 0e — resolution/weight gate (RZA, 2026-07-21, DEFAULT DISABLED —
+    # see Settings.RESOLUTION_CHECK_ENABLED). Bbox-independent (see
+    # app/resolution_check.py) — deliberately the EARLIEST gate in this
+    # function, ahead of even dedup below: a too-small/re-compressed frame
+    # is rejected before spending compute on phash/face-detection/anything
+    # else. verdict=low_quality (not spoof) — same "reshoot, don't accuse"
+    # posture as the blur/pose gates, a small image alone is not
+    # independently confirmed fraud.
+    reso_result = _run_resolution_gate(img, len(img_bytes))
+    if reso_result is not None:
+        ms = round((time.perf_counter() - t0) * 1000, 1)
+        reso_signals = _resolution_signals(reso_result)
+        _audit_entry(
+            req.correlation_id, req.transaction_type, req.transaction_ref,
+            "low_quality", reso_result.megapixels, reso_signals, ms, False, reason="LOW_RESOLUTION",
+        )
+        log.info(
+            "PAD check: correlation=%s verdict=low_quality reason=LOW_RESOLUTION "
+            "width=%d height=%d megapixels=%.3f byte_size=%d fired=%s ms=%.1f txn=%s",
+            req.correlation_id, reso_result.width, reso_result.height, reso_result.megapixels,
+            reso_result.byte_size, reso_result.reason, ms, req.transaction_ref,
+        )
+        return PadCheckResponse(
+            verdict="low_quality", reason="LOW_RESOLUTION", score=round(reso_result.megapixels, 4),
+            threshold=settings.MIN_IMAGE_MEGAPIXELS, face_detected=False,
+            save_frame=False, signals=reso_signals, model_version=MODEL_VERSION, processing_ms=ms,
+        )
+    # Disabled, bad input, or did not flag the frame — continue unchanged.
+
+    # --- Frame-reuse dedup (HARD BLOCK) — runs next, before the models-ready
+    # check, face detection, or any other gate below: this is a pure
+    # image-hash comparison against prior /pad/check frames, independent of
+    # whether models are loaded. See app/dedup_store.py module docstring —
+    # built in direct response to a real production fraud incident (2026-07-20): the
     # SAME photo accepted for TWO DIFFERENT abonents, 46s apart, one
     # inspector. DEFAULT DISABLED (settings.DEDUP_ENABLED, app/config.py) —
     # see that flag's docstring for why (no real duplicate-photo corpus yet
