@@ -455,3 +455,175 @@ class TestPadCheckFraudAlert:
                 abonent_id=f"abonent-{i}", inspector_id="insp-1",
             ))
         assert "fraud_alert" not in resp.json()["signals"]
+
+
+# ---------------------------------------------------------------------------
+# DEDUP_PHASH_HAMMING_MAX=8 calibration (RZA, 2026-07-21) — see
+# app/config.py::DEDUP_PHASH_HAMMING_MAX docstring for the full evidence.
+# Synthetic (not the external faces-dataset/ fixtures — those live outside
+# this repo and are used for manual calibration only, see the docstring's
+# real numbers) transformations standing in for "realistic re-share of the
+# same photo" vs "two different photos", pinning the threshold's actual
+# behavior as regression coverage.
+# ---------------------------------------------------------------------------
+
+class TestPHashHammingMaxCalibration:
+    def test_default_is_8_not_the_old_literature_4(self):
+        """Regression pin — see app/config.py docstring for the real-photo
+        evidence behind raising this from the literature default."""
+        from app.config import Settings
+        assert Settings().DEDUP_PHASH_HAMMING_MAX == 8
+
+    def test_requality_variants_still_within_default_threshold(self):
+        img = _make_test_image(seed=3)
+        h_original = compute_phash(img)
+        for quality in (30, 50, 70):
+            _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, quality])
+            recompressed = cv2.imdecode(np.frombuffer(buf.tobytes(), dtype=np.uint8), cv2.IMREAD_COLOR)
+            assert phash_hamming_distance(h_original, compute_phash(recompressed)) <= 8
+
+    def test_resize_variant_still_within_default_threshold(self):
+        img = _make_test_image(width=720, height=1280, seed=3)
+        h_original = compute_phash(img)
+        small = cv2.resize(img, (432, 768), interpolation=cv2.INTER_AREA)
+        _, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        resized = cv2.imdecode(np.frombuffer(buf.tobytes(), dtype=np.uint8), cv2.IMREAD_COLOR)
+        assert phash_hamming_distance(h_original, compute_phash(resized)) <= 8
+
+    def test_mild_rotation_now_caught_at_new_threshold(self):
+        """A ~2 degree rotation is exactly the case the OLD default (4)
+        missed (measured hamming=6 on the real fraud sample) — the new
+        default (8) must catch it."""
+        img = _make_test_image(width=720, height=1280, seed=3)
+        h, w = img.shape[:2]
+        h_original = compute_phash(img)
+        M = cv2.getRotationMatrix2D((w // 2, h // 2), 2, 1.0)
+        rotated = cv2.warpAffine(img, M, (w, h))
+        _, buf = cv2.imencode(".jpg", rotated, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        rotated = cv2.imdecode(np.frombuffer(buf.tobytes(), dtype=np.uint8), cv2.IMREAD_COLOR)
+        dist = phash_hamming_distance(h_original, compute_phash(rotated))
+        assert dist <= 8, f"expected the new threshold to catch a mild rotation, got hamming={dist}"
+
+    def test_deliberate_crop_still_evades_documented_limitation(self):
+        """A >=5% edge crop is a DOCUMENTED, known-uncaught evasion (see
+        app/config.py::DEDUP_PHASH_HAMMING_MAX docstring) — pinned here so a
+        future change to compute_phash that silently fixes (or worsens)
+        this doesn't go unnoticed."""
+        img = _make_test_image(width=720, height=1280, seed=3)
+        h, w = img.shape[:2]
+        h_original = compute_phash(img)
+        pct = 0.08
+        cropped = img[int(h * pct):int(h * (1 - pct)), int(w * pct):int(w * (1 - pct))]
+        _, buf = cv2.imencode(".jpg", cropped, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        cropped = cv2.imdecode(np.frombuffer(buf.tobytes(), dtype=np.uint8), cv2.IMREAD_COLOR)
+        dist = phash_hamming_distance(h_original, compute_phash(cropped))
+        assert dist > 8, (
+            "an 8%% crop was expected to still evade pHash dedup (documented limitation) — "
+            f"got hamming={dist}, which would mean this limitation no longer applies"
+        )
+
+    def test_different_photos_stay_well_above_new_threshold(self):
+        """False-collision safety margin: two different photos must not
+        creep anywhere near the raised threshold."""
+        img_a = _make_test_image(seed=1)
+        img_b = _make_test_image(seed=9)
+        dist = phash_hamming_distance(compute_phash(img_a), compute_phash(img_b))
+        assert dist > 8
+
+
+# ---------------------------------------------------------------------------
+# Real confirmed-fraud sample (RZA, 2026-07-21) — faces-dataset/real-fakes/,
+# outside this repo (a sibling E-GAZ dataset checkout), so these tests SKIP
+# gracefully rather than fail when that path isn't present (e.g. a fresh CI
+# checkout of only this repo). See docs/plans/HANDOFF-2026-07-21-
+# cross-transaction-face-reuse.md for the full incident writeup.
+# ---------------------------------------------------------------------------
+
+_REAL_FAKE_DIR = Path("/home/mrnurali/E-GAZ/faces-dataset/real-fakes")
+_REAL_FAKE_ORIGINAL = _REAL_FAKE_DIR / "real_fake_01.jpg"
+_REAL_FAKE_DUP = _REAL_FAKE_DIR / "real_fake_01_dup.jpg"
+_HAS_REAL_FAKE_SAMPLE = _REAL_FAKE_ORIGINAL.exists() and _REAL_FAKE_DUP.exists()
+
+
+@pytest.mark.skipif(not _HAS_REAL_FAKE_SAMPLE, reason="faces-dataset/real-fakes/ not present on this checkout")
+class TestPadCheckRealFraudSampleDedup:
+    """The actual confirmed-fraud photo pair (one live person's photo,
+    submitted byte-identical for two different sales — the real-world shape
+    of the 2026-07-20 incident this whole feature exists for), driven
+    through the real /pad/check HTTP path, not a synthetic stand-in."""
+
+    def test_real_duplicate_pair_blocked_when_enabled(self, client):
+        import app.main as m
+        m.settings.DEDUP_ENABLED = True
+
+        original_b64 = base64.b64encode(_REAL_FAKE_ORIGINAL.read_bytes()).decode()
+        dup_b64 = base64.b64encode(_REAL_FAKE_DUP.read_bytes()).decode()
+
+        resp1 = client.post("/pad/check", json={
+            "correlation_id": "real-fake-c1", "transaction_type": "sale",
+            "transaction_ref": "real-req1:bal1", "face_photo": original_b64,
+        })
+        assert resp1.status_code == 200
+        assert resp1.json()["verdict"] == "live"  # first submission, nothing to match yet
+
+        resp2 = client.post("/pad/check", json={
+            "correlation_id": "real-fake-c2", "transaction_type": "sale",
+            "transaction_ref": "real-req2:bal2", "face_photo": dup_b64,
+        })
+        assert resp2.status_code == 200
+        data2 = resp2.json()
+        assert data2["verdict"] == "spoof"
+        assert data2["reason"] == "DUPLICATE_PHOTO"
+        assert data2["signals"]["dedup_check"]["hamming_distance"] == 0  # byte-identical files
+
+    def test_real_duplicate_pair_not_blocked_when_disabled(self, client):
+        import app.main as m
+        assert m.settings.DEDUP_ENABLED is False
+
+        original_b64 = base64.b64encode(_REAL_FAKE_ORIGINAL.read_bytes()).decode()
+        dup_b64 = base64.b64encode(_REAL_FAKE_DUP.read_bytes()).decode()
+
+        client.post("/pad/check", json={
+            "correlation_id": "real-fake-c3", "transaction_type": "sale",
+            "transaction_ref": "real-req3:bal3", "face_photo": original_b64,
+        })
+        resp2 = client.post("/pad/check", json={
+            "correlation_id": "real-fake-c4", "transaction_type": "sale",
+            "transaction_ref": "real-req4:bal4", "face_photo": dup_b64,
+        })
+        assert resp2.json()["verdict"] == "live"  # gate off — nothing catches the reuse
+
+
+# ---------------------------------------------------------------------------
+# image_phash additive response field (RZA, 2026-07-21) — see
+# docs/plans/HANDOFF-2026-07-21-cross-transaction-face-reuse.md. Always
+# present regardless of DEDUP_ENABLED — cheap, already computed either way.
+# ---------------------------------------------------------------------------
+
+class TestImagePhashHandoffField:
+    def test_present_on_normal_live_verdict_regardless_of_dedup_flag(self, client):
+        import app.main as m
+        assert m.settings.DEDUP_ENABLED is False  # explicitly off for this test
+
+        resp = client.post("/pad/check", json=_pad_check_body("c1", "req1:bal1", seed=1))
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["verdict"] == "live"
+        assert "image_phash" in data["signals"]
+        assert len(data["signals"]["image_phash"]) == 16  # 64-bit hex string
+        int(data["signals"]["image_phash"], 16)  # must parse as hex
+
+    def test_same_bytes_produce_same_phash_across_requests(self, client):
+        resp1 = client.post("/pad/check", json=_pad_check_body("c1", "req1:bal1", seed=5))
+        resp2 = client.post("/pad/check", json=_pad_check_body("c2", "req2:bal2", seed=5))
+        assert resp1.json()["signals"]["image_phash"] == resp2.json()["signals"]["image_phash"]
+
+    def test_present_on_duplicate_photo_reject_path_too(self, client):
+        import app.main as m
+        m.settings.DEDUP_ENABLED = True
+
+        client.post("/pad/check", json=_pad_check_body("c1", "req1:bal1", seed=1))
+        resp2 = client.post("/pad/check", json=_pad_check_body("c2", "req2:bal2", seed=1))
+        data2 = resp2.json()
+        assert data2["reason"] == "DUPLICATE_PHOTO"
+        assert "image_phash" in data2["signals"]

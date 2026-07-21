@@ -171,3 +171,94 @@ class TestVerifyBatchResolutionLayer:
         data = resp.json()
         assert data["results"][0]["label"] == "low_quality"
         assert data["results"][1]["is_real"] is True
+
+
+def _make_shaped_image_bytes(width: int, height: int, seed: int = 3) -> bytes:
+    rng = np.random.default_rng(seed)
+    img = np.zeros((height, width, 3), dtype=np.uint8)
+    cv2.circle(img, (width // 2, height // 2), min(width, height) // 3, (200, 180, 160), -1)
+    noise = rng.integers(-30, 30, size=img.shape, dtype=np.int16)
+    img = np.clip(img.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+    _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    return buf.tobytes()
+
+
+class TestVerifyAspectRatioLayer:
+    """Layer 0g — see app/aspect_ratio_check.py. Same disabled-by-default /
+    bbox-independent-block pattern as TestVerifyResolutionLayer above."""
+
+    def test_disabled_by_default_9x16_frame_passes_through(self, client):
+        resp = client.post(
+            "/verify",
+            files={"image": ("photo.jpg", _make_shaped_image_bytes(720, 1280), "image/jpeg")},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["is_real"] is True
+
+    def test_enabled_9x16_frame_rejected_as_low_quality(self, client):
+        import app.main as m
+        m.settings.ASPECT_RATIO_CHECK_ENABLED = True
+        try:
+            resp = client.post(
+                "/verify",
+                files={"image": ("photo.jpg", _make_shaped_image_bytes(720, 1280), "image/jpeg")},
+            )
+        finally:
+            m.settings.ASPECT_RATIO_CHECK_ENABLED = False
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["is_real"] is False
+        assert data["label"] == "non_camera_geometry"
+        assert "aspect_ratio_check" in data["signals"]
+
+    def test_enabled_3x4_frame_passes_through(self, client):
+        import app.main as m
+        m.settings.ASPECT_RATIO_CHECK_ENABLED = True
+        try:
+            resp = client.post(
+                "/verify",
+                files={"image": ("photo.jpg", _make_shaped_image_bytes(960, 1280), "image/jpeg")},
+            )
+        finally:
+            m.settings.ASPECT_RATIO_CHECK_ENABLED = False
+
+        assert resp.status_code == 200
+        assert resp.json()["is_real"] is True
+
+
+class TestVerifyBatchAspectRatioLayer:
+    def test_enabled_9x16_frame_rejected_without_face_detection(self, client):
+        import app.main as m
+        m.settings.ASPECT_RATIO_CHECK_ENABLED = True
+        try:
+            resp = client.post(
+                "/verify_batch",
+                files=[("images", ("photo.jpg", _make_shaped_image_bytes(720, 1280), "image/jpeg"))],
+            )
+        finally:
+            m.settings.ASPECT_RATIO_CHECK_ENABLED = False
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["results"][0]["label"] == "non_camera_geometry"
+        m.detector.detect.assert_not_called()
+
+    def test_enabled_mixed_batch_only_9x16_frame_rejected(self, client):
+        import app.main as m
+        m.settings.ASPECT_RATIO_CHECK_ENABLED = True
+        try:
+            resp = client.post(
+                "/verify_batch",
+                files=[
+                    ("images", ("fake_shape.jpg", _make_shaped_image_bytes(720, 1280), "image/jpeg")),
+                    ("images", ("camera_shape.jpg", _make_shaped_image_bytes(960, 1280), "image/jpeg")),
+                ],
+            )
+        finally:
+            m.settings.ASPECT_RATIO_CHECK_ENABLED = False
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["results"][0]["label"] == "non_camera_geometry"
+        assert data["results"][1]["is_real"] is True

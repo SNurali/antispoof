@@ -1016,3 +1016,205 @@ class TestPadCheckResolutionLayer:
         })
         assert resp.status_code == 200
         assert resp.json()["verdict"] == "live"
+
+
+# ---------------------------------------------------------------------------
+# POST /pad/check — Layer 0f edge-sharpness DIAGNOSTIC (RZA, 2026-07-21)
+#
+# NOT A GATE — see app/edge_sharpness_check.py's module docstring. These
+# tests exist ONLY to pin "disabled by default" and "never changes verdict
+# even when enabled" — there is deliberately no "gets blocked" test here,
+# because this signal is never wired into a reject decision.
+# ---------------------------------------------------------------------------
+
+class TestPadCheckEdgeSharpnessDiagnostic:
+    def test_disabled_by_default_no_signal_present(self, client):
+        import app.main as m
+        assert m.settings.EDGE_SHARPNESS_DIAGNOSTIC_ENABLED is False
+
+        resp = client.post("/pad/check", json={
+            "correlation_id": "test-edge-disabled",
+            "transaction_type": "sale",
+            "transaction_ref": "req:bal",
+            "face_photo": _make_base64_image(),
+        })
+        assert resp.status_code == 200
+        assert resp.json()["verdict"] == "live"
+        assert "edge_sharpness_diagnostic" not in resp.json()["signals"]
+
+    def test_enabled_signal_present_but_never_changes_verdict(self, client):
+        """Even with an image whose left/right/center Laplacian ratios would
+        look 'suspicious' by the original (shelved) hypothesis, the verdict
+        must be driven ONLY by passive-PAD's mocked result — this signal is
+        diagnostic data attached alongside it, never a gate input."""
+        import app.main as m
+
+        # Deliberately asymmetric synthetic frame: sharp circle (textured)
+        # off-center, flat background — analogous in spirit to the real
+        # sample that motivated this module, but that is irrelevant to what
+        # this test actually asserts (verdict is untouched either way).
+        img = np.zeros((300, 300, 3), dtype=np.uint8)
+        cv2.circle(img, (220, 150), 60, (200, 180, 160), -1)
+        noise = np.random.default_rng(1).integers(-30, 30, size=img.shape, dtype=np.int16)
+        img = np.clip(img.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+        _, buf = cv2.imencode(".jpg", img)
+        b64 = base64.b64encode(buf.tobytes()).decode()
+
+        m.settings.EDGE_SHARPNESS_DIAGNOSTIC_ENABLED = True
+        try:
+            resp = client.post("/pad/check", json={
+                "correlation_id": "test-edge-enabled",
+                "transaction_type": "sale",
+                "transaction_ref": "req:bal",
+                "face_photo": b64,
+            })
+        finally:
+            m.settings.EDGE_SHARPNESS_DIAGNOSTIC_ENABLED = False
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["verdict"] == "live"  # mocked passive-PAD's verdict, UNCHANGED by this signal
+        assert "edge_sharpness_diagnostic" in data["signals"]
+        diag = data["signals"]["edge_sharpness_diagnostic"]
+        assert "left_sharpness" in diag
+        assert "right_sharpness" in diag
+        assert "center_sharpness" in diag
+        assert "min_edge_to_center_ratio" in diag
+        assert "note" in diag  # explicit "not wired into verdict" disclaimer
+
+    def test_disabled_flag_explicit_no_signal_even_with_geometry_hit(self, client):
+        """Confirms this diagnostic is independent of / does not leak in on
+        an early Layer 0a short-circuit either — geometry gate returns
+        before this diagnostic would ever run, so it must be absent."""
+        import app.main as m
+        m.detector.detect.return_value = [10, 10, 140, 140]  # triggers DOCUMENT_PHOTO
+        try:
+            resp = client.post("/pad/check", json={
+                "correlation_id": "test-edge-geo-shortcircuit",
+                "transaction_type": "sale",
+                "transaction_ref": "req:bal",
+                "face_photo": _make_base64_image(),
+            })
+        finally:
+            m.detector.detect.return_value = [50, 50, 100, 100]
+
+        assert resp.status_code == 200
+        assert "edge_sharpness_diagnostic" not in resp.json()["signals"]
+
+
+# ---------------------------------------------------------------------------
+# POST /pad/check — Layer 0g camera-aspect-ratio gate (RZA, 2026-07-21)
+# ---------------------------------------------------------------------------
+
+def _make_shaped_base64_image(width: int, height: int, seed: int = 0) -> str:
+    """Textured (not flat), so JPEG weight/detail is realistic — same
+    helper shape as _make_client_shaped_base64_image in this file."""
+    rng = np.random.default_rng(seed)
+    img = np.zeros((height, width, 3), dtype=np.uint8)
+    cv2.circle(img, (width // 2, height // 2), min(width, height) // 3, (200, 180, 160), -1)
+    noise = rng.integers(-30, 30, size=img.shape, dtype=np.int16)
+    img = np.clip(img.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+    _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    return base64.b64encode(buf.tobytes()).decode()
+
+
+class TestPadCheckAspectRatioLayer:
+    def test_disabled_by_default_never_blocks_9x16_frame(self, client):
+        """ASPECT_RATIO_CHECK_ENABLED defaults to False — a 9:16-shaped
+        frame (the real confirmed-fraud sample's own shape) must still fall
+        through to passive-PAD unchanged until an operator opts in."""
+        import app.main as m
+        assert m.settings.ASPECT_RATIO_CHECK_ENABLED is False
+
+        resp = client.post("/pad/check", json={
+            "correlation_id": "test-aspect-disabled",
+            "transaction_type": "sale",
+            "transaction_ref": "req:bal",
+            "face_photo": _make_shaped_base64_image(720, 1280),
+        })
+        assert resp.status_code == 200
+        assert resp.json()["verdict"] == "live"  # mocked passive-PAD, gate never ran
+
+    def test_enabled_9x16_frame_short_circuits_to_low_quality(self, client):
+        """ASPECT_RATIO_CHECK_ENABLED=True + a 720x1280 (9:16, the real
+        real_fake_01.jpg shape) frame => verdict=low_quality,
+        reason=NON_CAMERA_GEOMETRY, WITHOUT ever calling passive-PAD
+        (engine.predict) OR even face detection — bbox-independent, same
+        pattern as TestPadCheckResolutionLayer."""
+        import app.main as m
+
+        m.settings.ASPECT_RATIO_CHECK_ENABLED = True
+        try:
+            with patch.object(m.engine, "predict") as mock_predict, \
+                 patch.object(m.detector, "detect") as mock_detect:
+                resp = client.post("/pad/check", json={
+                    "correlation_id": "test-aspect-blocked",
+                    "transaction_type": "sale",
+                    "transaction_ref": "req:bal",
+                    "face_photo": _make_shaped_base64_image(720, 1280),
+                })
+            mock_predict.assert_not_called()
+            mock_detect.assert_not_called()
+        finally:
+            m.settings.ASPECT_RATIO_CHECK_ENABLED = False
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["verdict"] == "low_quality"
+        assert data["reason"] == "NON_CAMERA_GEOMETRY"
+        assert data["save_frame"] is False
+        assert data["face_detected"] is False
+        assert data["signals"]["aspect_ratio_check"]["ratio"] == pytest.approx(0.5625)
+
+    def test_enabled_client_shaped_3x4_frame_falls_through(self, client):
+        """A 960x1280 (3:4, egaz-mobile's real capture shape) frame must
+        NOT be rejected by this layer even when enabled."""
+        import app.main as m
+
+        m.settings.ASPECT_RATIO_CHECK_ENABLED = True
+        try:
+            resp = client.post("/pad/check", json={
+                "correlation_id": "test-aspect-pass-3x4",
+                "transaction_type": "sale",
+                "transaction_ref": "req:bal",
+                "face_photo": _make_shaped_base64_image(960, 1280),
+            })
+        finally:
+            m.settings.ASPECT_RATIO_CHECK_ENABLED = False
+
+        assert resp.status_code == 200
+        assert resp.json()["verdict"] == "live"
+
+    def test_enabled_owner_supplied_bona_fide_shape_falls_through(self, client):
+        """1920x2560 (3:4) — the owner-supplied real bona fide reference
+        photo's exact shape — must not be rejected."""
+        import app.main as m
+
+        m.settings.ASPECT_RATIO_CHECK_ENABLED = True
+        try:
+            resp = client.post("/pad/check", json={
+                "correlation_id": "test-aspect-pass-bonafide",
+                "transaction_type": "sale",
+                "transaction_ref": "req:bal",
+                "face_photo": _make_shaped_base64_image(768, 1024),  # 3:4, smaller for test speed
+            })
+        finally:
+            m.settings.ASPECT_RATIO_CHECK_ENABLED = False
+
+        assert resp.status_code == 200
+        assert resp.json()["verdict"] == "live"
+
+    def test_disabled_flag_explicit_skips_layer_even_with_9x16_frame(self, client):
+        """Symmetric to TestPadCheckResolutionLayer's explicit-disabled
+        test."""
+        import app.main as m
+
+        m.settings.ASPECT_RATIO_CHECK_ENABLED = False
+        resp = client.post("/pad/check", json={
+            "correlation_id": "test-aspect-explicit-disabled",
+            "transaction_type": "sale",
+            "transaction_ref": "req:bal",
+            "face_photo": _make_shaped_base64_image(720, 1280),
+        })
+        assert resp.status_code == 200
+        assert resp.json()["verdict"] == "live"

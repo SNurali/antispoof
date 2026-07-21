@@ -39,10 +39,12 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.active_challenge import verify_challenge
+from app.aspect_ratio_check import AspectRatioCheckResult, check_aspect_ratio
 from app.blur_check import SharpnessCheckResult, check_face_sharpness
 from app.config import Settings, resolve_device
 from app.dedup_store import build_dedup_store, compute_phash
 from app.document_check import DocumentPhotoChecker
+from app.edge_sharpness_check import measure_edge_sharpness
 from app.face_detect import FaceDetector
 from app.frame_qc import assess_frame
 from app.geometry_check import GeometryCheckResult, check_face_geometry
@@ -577,6 +579,42 @@ def _resolution_signals(result: ResolutionCheckResult) -> dict:
     }
 
 
+def _run_aspect_ratio_gate(image_bgr: np.ndarray) -> Optional[AspectRatioCheckResult]:
+    """Layer 0g — shared camera-aspect-ratio gate (RZA, 2026-07-21).
+
+    Bbox-independent (no face detection needed, same shape as
+    _run_resolution_gate) — see app/aspect_ratio_check.py for the full
+    rationale (a real confirmed-fraud sample and 174/199 of
+    faces-dataset/'s files sit at a 9:16 "screen" ratio a phone camera
+    still-photo never produces) and the numbers behind every threshold.
+
+    Returns the `AspectRatioCheckResult` when the gate fired (caller should
+    short-circuit to its own low_quality response), or `None` when
+    disabled, did not run (bad input), or did not flag the frame (caller
+    falls through unchanged). Never raises.
+    """
+    if not settings.ASPECT_RATIO_CHECK_ENABLED:
+        return None
+    h, w = image_bgr.shape[:2]
+    result = check_aspect_ratio(w, h, settings.ASPECT_RATIO_MIN, settings.ASPECT_RATIO_MAX)
+    if result.ran and result.is_non_camera_geometry:
+        return result
+    return None
+
+
+def _aspect_ratio_signals(result: AspectRatioCheckResult) -> dict:
+    """Build the `signals` sub-dict shape used across endpoints for an aspect-ratio-gate hit."""
+    return {
+        "aspect_ratio_check": {
+            "width": result.width,
+            "height": result.height,
+            "ratio": result.ratio,
+            "min_ratio": settings.ASPECT_RATIO_MIN,
+            "max_ratio": settings.ASPECT_RATIO_MAX,
+        }
+    }
+
+
 def _run_geometry_gate(bbox: list[int], image_bgr: np.ndarray) -> Optional[GeometryCheckResult]:
     """Layer 0a — shared face-to-frame geometry gate.
 
@@ -688,6 +726,35 @@ def _pose_signals(result: PoseCheckResult) -> dict:
     }
 
 
+def _run_edge_sharpness_diagnostic(image_bgr: np.ndarray) -> Optional[dict]:
+    """Layer 0f — edge-vs-center sharpness DIAGNOSTIC (RZA, 2026-07-21).
+
+    NOT a gate — see app/edge_sharpness_check.py's module docstring for why
+    (an asymmetric-edge-blur hypothesis was tested against a real bona fide
+    counter-example the same day and did not hold up). Returns a `signals`
+    sub-dict to merge into the response when `EDGE_SHARPNESS_DIAGNOSTIC_
+    ENABLED=True` and the measurement ran successfully, or `None` when
+    disabled or the measurement failed (bad input) — the caller must NEVER
+    branch on this to change `verdict`, only attach it as extra data.
+    """
+    if not settings.EDGE_SHARPNESS_DIAGNOSTIC_ENABLED:
+        return None
+    result = measure_edge_sharpness(image_bgr, settings.EDGE_SHARPNESS_EDGE_FRACTION)
+    if not result.ran:
+        return None
+    return {
+        "edge_sharpness_diagnostic": {
+            "left_sharpness": result.left_sharpness,
+            "right_sharpness": result.right_sharpness,
+            "center_sharpness": result.center_sharpness,
+            "left_to_center_ratio": result.left_to_center_ratio,
+            "right_to_center_ratio": result.right_to_center_ratio,
+            "min_edge_to_center_ratio": result.min_edge_to_center_ratio,
+            "note": "DIAGNOSTIC ONLY, not wired into verdict — see app/edge_sharpness_check.py",
+        }
+    }
+
+
 def _run_single(image_bgr: np.ndarray, byte_size: int = 0) -> dict:
     """Detect face + (Layer 0a geometry gate) + predict liveness for a single image.
 
@@ -706,6 +773,17 @@ def _run_single(image_bgr: np.ndarray, byte_size: int = 0) -> dict:
             "threshold": settings.MIN_IMAGE_MEGAPIXELS,
             "face_detected": False,
             "signals": _resolution_signals(reso_result),
+        }
+
+    aspect_result = _run_aspect_ratio_gate(image_bgr)
+    if aspect_result is not None:
+        return {
+            "is_real": False,
+            "label": "non_camera_geometry",
+            "score": aspect_result.ratio,
+            "threshold": settings.ASPECT_RATIO_MIN,
+            "face_detected": False,
+            "signals": _aspect_ratio_signals(aspect_result),
         }
 
     bbox = detector.detect(image_bgr)
@@ -810,14 +888,14 @@ async def verify_batch(images: list[UploadFile] = File(...)) -> dict:
 
     t0 = time.perf_counter()
 
-    decoded: list[tuple[np.ndarray, Optional[list[int]], str, Optional[ResolutionCheckResult]]] = []
+    decoded: list[tuple[np.ndarray, Optional[list[int]], str, Optional[ResolutionCheckResult], Optional[AspectRatioCheckResult]]] = []
     for upload in images:
         if not upload.content_type or not upload.content_type.startswith("image/"):
-            decoded.append((np.zeros((1, 1, 3), dtype=np.uint8), None, "not an image", None))
+            decoded.append((np.zeros((1, 1, 3), dtype=np.uint8), None, "not an image", None, None))
             continue
         data = await upload.read()
         if not data:
-            decoded.append((np.zeros((1, 1, 3), dtype=np.uint8), None, "empty file", None))
+            decoded.append((np.zeros((1, 1, 3), dtype=np.uint8), None, "empty file", None, None))
             continue
         _validate_image_size(data)
         img = _read_image(data)
@@ -827,17 +905,24 @@ async def verify_batch(images: list[UploadFile] = File(...)) -> dict:
         # skip that cost entirely on a frame this gate would reject anyway.
         reso_result = _run_resolution_gate(img, len(data))
         if reso_result is not None:
-            decoded.append((img, None, "", reso_result))
+            decoded.append((img, None, "", reso_result, None))
+            continue
+        # Layer 0g aspect-ratio gate — same bbox-independent shape (see
+        # app/aspect_ratio_check.py), runs right after the resolution gate,
+        # still before face detection.
+        aspect_result = _run_aspect_ratio_gate(img)
+        if aspect_result is not None:
+            decoded.append((img, None, "", None, aspect_result))
             continue
         bbox = detector.detect(img)
-        decoded.append((img, bbox, "", None))
+        decoded.append((img, bbox, "", None, None))
 
     crops: list[np.ndarray] = []
     crop_face_px: list[int] = []
     crop_indices: list[int] = []
     results: list[dict] = [{}] * len(decoded)
 
-    for i, (img, bbox, err, reso_result) in enumerate(decoded):
+    for i, (img, bbox, err, reso_result, aspect_result) in enumerate(decoded):
         if err:
             results[i] = {"is_real": False, "label": "no_face", "score": 0.0,
                            "threshold": settings.LIVENESS_THRESHOLD,
@@ -850,6 +935,15 @@ async def verify_batch(images: list[UploadFile] = File(...)) -> dict:
                 "threshold": settings.MIN_IMAGE_MEGAPIXELS,
                 "face_detected": False,
                 "signals": _resolution_signals(reso_result),
+            }
+        elif aspect_result is not None:
+            results[i] = {
+                "is_real": False,
+                "label": "non_camera_geometry",
+                "score": aspect_result.ratio,
+                "threshold": settings.ASPECT_RATIO_MIN,
+                "face_detected": False,
+                "signals": _aspect_ratio_signals(aspect_result),
             }
         elif bbox is None:
             results[i] = {"is_real": False, "label": "no_face", "score": 0.0,
@@ -993,6 +1087,14 @@ async def spoof_server(req: SpoofRequest) -> SpoofServerResponse:
         # _run_single's own low_quality branch.
         verdict = "low_quality"
         reason = "LOW_RESOLUTION"
+    elif label == "non_camera_geometry":
+        # Layer 0g aspect-ratio gate (app/aspect_ratio_check.py) — see
+        # _run_single's own non_camera_geometry branch. Same numeric-
+        # fallback trap as BLURRY/LOW_RESOLUTION above: `score=ratio` (e.g.
+        # 0.56 for a 9:16 frame) sits ABOVE LIVENESS_THRESHOLD (0.5) far
+        # more often than not, so this needs its own explicit branch too.
+        verdict = "low_quality"
+        reason = "NON_CAMERA_GEOMETRY"
     elif score < settings.LIVENESS_THRESHOLD:
         # Real face but low passive-PAD score (bad lighting, occlusion,
         # etc.) → low quality. Only reached for labels NOT already handled
@@ -1044,7 +1146,8 @@ class PadCheckResponse(BaseModel):
         None,
         description=(
             "PASSIVE_PAD_SPOOF | DOCUMENT_PHOTO | BLURRY | OFF_ANGLE | LOW_RESOLUTION | "
-            "DUPLICATE_PHOTO | NO_FACE | LOW_QUALITY | TIMEOUT | INTERNAL_ERROR | null"
+            "NON_CAMERA_GEOMETRY | DUPLICATE_PHOTO | NO_FACE | LOW_QUALITY | TIMEOUT | "
+            "INTERNAL_ERROR | null"
         ),
     )
     score: float = Field(..., description="Confidence score [0..1]")
@@ -1187,6 +1290,39 @@ async def pad_check(
         )
     # Disabled, bad input, or did not flag the frame — continue unchanged.
 
+    # Layer 0g — camera-aspect-ratio gate (RZA, 2026-07-21, DEFAULT DISABLED
+    # — see Settings.ASPECT_RATIO_CHECK_ENABLED). Bbox-independent (see
+    # app/aspect_ratio_check.py) — right after the resolution gate, still
+    # ahead of dedup below: a real confirmed-fraud sample (real_fake_01.jpg)
+    # and 174/199 of faces-dataset/'s Telegram-preview files share a 9:16
+    # ("screen") aspect a phone camera still-photo never produces.
+    # verdict=low_quality (NOT spoof) — same "reshoot, don't accuse" posture
+    # as every other Layer 0 gate: a wrong-aspect frame alone is not
+    # independently confirmed fraud (a legitimate integration bug or
+    # non-standard device could also produce this) — see the module
+    # docstring's own limitation #1 (trivially defeated by cropping the fake
+    # to 3:4 first — this is a cheap first layer, not a final defense).
+    aspect_result = _run_aspect_ratio_gate(img)
+    if aspect_result is not None:
+        ms = round((time.perf_counter() - t0) * 1000, 1)
+        aspect_signals = _aspect_ratio_signals(aspect_result)
+        _audit_entry(
+            req.correlation_id, req.transaction_type, req.transaction_ref,
+            "low_quality", aspect_result.ratio, aspect_signals, ms, False, reason="NON_CAMERA_GEOMETRY",
+        )
+        log.info(
+            "PAD check: correlation=%s verdict=low_quality reason=NON_CAMERA_GEOMETRY "
+            "width=%d height=%d ratio=%.4f ms=%.1f txn=%s",
+            req.correlation_id, aspect_result.width, aspect_result.height, aspect_result.ratio,
+            ms, req.transaction_ref,
+        )
+        return PadCheckResponse(
+            verdict="low_quality", reason="NON_CAMERA_GEOMETRY", score=round(aspect_result.ratio, 4),
+            threshold=settings.ASPECT_RATIO_MIN, face_detected=False,
+            save_frame=False, signals=aspect_signals, model_version=MODEL_VERSION, processing_ms=ms,
+        )
+    # Disabled, bad input, or did not flag the frame — continue unchanged.
+
     # --- Frame-reuse dedup (HARD BLOCK) — runs next, before the models-ready
     # check, face detection, or any other gate below: this is a pure
     # image-hash comparison against prior /pad/check frames, independent of
@@ -1216,7 +1352,10 @@ async def pad_check(
                     "matched_correlation_id": dedup_match.correlation_id,
                     "matched_transaction_ref": dedup_match.transaction_ref,
                     "matched_age_s": dedup_match.age_s,
-                }
+                },
+                # See docs/plans/HANDOFF-2026-07-21-cross-transaction-face-reuse.md
+                # — same additive field as the normal-verdict response path.
+                "image_phash": dedup_phash,
             }
             _audit_entry(
                 req.correlation_id, req.transaction_type, req.transaction_ref,
@@ -1505,6 +1644,27 @@ async def pad_check(
 
     if fraud_signal:
         signal_info = {**signal_info, **fraud_signal}
+
+    # Cross-transaction reuse handoff (RZA, 2026-07-21) — see
+    # docs/plans/HANDOFF-2026-07-21-cross-transaction-face-reuse.md. This
+    # service's own DEDUP_ENABLED only compares against its OWN short-lived
+    # SQLite window (DEDUP_TTL_DAYS) and has no idea which abonent_id a
+    # frame belongs to across the caller's full history — Laravel does.
+    # `dedup_phash` is already computed above UNCONDITIONALLY (cheap, no
+    # extra model) regardless of DEDUP_ENABLED; surfacing it here, on every
+    # normal response, costs nothing extra and lets the caller persist it
+    # against its own abonent/transaction records for a server-side
+    # "same photo hash across N different abonents" rule with a much wider
+    # window than this service could reasonably own.
+    signal_info = {**signal_info, "image_phash": dedup_phash}
+
+    # Layer 0f — edge-vs-center sharpness DIAGNOSTIC (RZA, 2026-07-21,
+    # DEFAULT DISABLED). NEVER changes `verdict` — see
+    # _run_edge_sharpness_diagnostic's own docstring and
+    # app/edge_sharpness_check.py for why this stays diagnostic-only.
+    edge_signal = _run_edge_sharpness_diagnostic(img)
+    if edge_signal is not None:
+        signal_info = {**signal_info, **edge_signal}
 
     save_frame = verdict in _save_frame_verdicts
     processing_ms = round((time.perf_counter() - t0) * 1000, 1)

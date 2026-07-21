@@ -395,3 +395,29 @@ class TestSpoofServerBlurryVerdictMappingFix:
         assert data["verdict"] == "low_quality", \
             "blurry-gate hit must map to low_quality, not silently fall through to live"
         assert data["reason"] == "BLURRY"
+
+
+class TestSpoofServerAspectRatioLayer:
+    def test_disabled_by_default_never_blocks_9x16_frame(self, client):
+        """ASPECT_RATIO_CHECK_ENABLED defaults to False."""
+        resp = client.post("/spoof-server", json={"photo": _make_base64_image(720, 1280)})
+        assert resp.status_code == 200
+        assert resp.json()["verdict"] == "live"
+
+    def test_enabled_9x16_frame_maps_to_non_camera_geometry(self, client):
+        """REGRESSION-shaped test, same class as TestSpoofServerBlurryVerdictMappingFix:
+        `non_camera_geometry`'s score=ratio (e.g. 0.5625) sits ABOVE
+        LIVENESS_THRESHOLD (0.5) — without an explicit branch this would
+        have silently fallen through to verdict='live'."""
+        import app.main as m
+        m.settings.ASPECT_RATIO_CHECK_ENABLED = True
+        try:
+            resp = client.post("/spoof-server", json={"photo": _make_base64_image(720, 1280)})
+        finally:
+            m.settings.ASPECT_RATIO_CHECK_ENABLED = False
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["verdict"] == "low_quality"
+        assert data["reason"] == "NON_CAMERA_GEOMETRY"
+        assert data["is_spoof"] == 1

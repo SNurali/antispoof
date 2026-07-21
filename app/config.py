@@ -230,6 +230,31 @@ class Settings(BaseSettings):
     # floor — see module docstring limitation #2 before ever raising it.
     MIN_IMAGE_BYTES: int = 15 * 1024
 
+    # Layer 0g — camera-aspect-ratio gate (RZA, 2026-07-21, owner-supplied
+    # signal). See app/aspect_ratio_check.py module docstring for the full
+    # rationale (a real confirmed-fraud sample, real_fake_01.jpg, is 720x1280
+    # = 9:16 — a SCREEN/video ratio, never a phone camera still-photo ratio;
+    # 174 of faces-dataset/'s 199 Telegram-preview files independently sit
+    # at the exact same 9:16 shape) and the numbers behind every threshold.
+    # Bbox-independent (pure arithmetic on width/height, no model) — same
+    # posture as RESOLUTION_CHECK_ENABLED, and DEFAULT DISABLED for the
+    # same reason: real-device confirmation is thin (one client-source
+    # read, one owner-supplied bona fide photo), and the existing test
+    # suite's shared 200x200 (1:1) fixture image sits OUTSIDE this gate's
+    # allowed band — flipping the default on would break it, same
+    # "would break the existing test suite's shared fixture" reasoning
+    # already documented for RESOLUTION_CHECK_ENABLED/
+    # FRAME_SHARPNESS_CHECK_ENABLED above.
+    ASPECT_RATIO_CHECK_ENABLED: bool = False
+    # Band around the two camera-photo ratios the owner named (3:4=0.75,
+    # 4:5=0.80): 0.70-0.85 clears every camera-shaped sample measured
+    # (0.75-0.7788) with margin, while rejecting the 9:16 shape (0.5625,
+    # ~24% below the floor) the real fraud sample and 174/199 dataset files
+    # share, and a 1:1 square (1.0, ~15% above the ceiling). See module
+    # docstring for the full worked numbers.
+    ASPECT_RATIO_MIN: float = 0.70
+    ASPECT_RATIO_MAX: float = 0.85
+
     # Layer 0d — face-angle (yaw/pitch) gate (RZA, 2026-07-21). See
     # app/pose_check.py module docstring for the full rationale and
     # calibration numbers (s001, n=1 subject).
@@ -251,6 +276,26 @@ class Settings(BaseSettings):
     # fide up/down tilts measured ~35-37 actual — 45.0 leaves ~8 degrees
     # margin for an ordinary checkout glance. See app/pose_check.py.
     POSE_PITCH_REJECT_DEG: float = 45.0
+
+    # Layer 0f — edge-vs-center sharpness DIAGNOSTIC (RZA, 2026-07-21).
+    # NOT A GATE — see app/edge_sharpness_check.py's module docstring for
+    # the full story: an initial hypothesis ("asymmetric edge blur = attack
+    # signature", from a forensic pass on real_fake_01.jpg) was tested
+    # against a real bona fide counter-example the SAME day (a genuine live
+    # photo showing the same soft-edge/sharp-center pattern, ratio 0.38 vs
+    # the fake's 0.28 — not cleanly separated) and did NOT hold up. This
+    # flag only controls whether the raw measurement (left/right/center
+    # Laplacian variance + ratios) is computed and attached to /pad/check's
+    # response `signals` for future recalibration on a larger real corpus —
+    # it NEVER changes `verdict`. DEFAULT DISABLED because even a
+    # non-blocking diagnostic costs CPU (one extra Laplacian pass over the
+    # full frame) on every request for a signal nobody can act on yet.
+    EDGE_SHARPNESS_DIAGNOSTIC_ENABLED: bool = False
+    # Width of the left/right measurement strip, as a fraction of frame
+    # width. 0.12 matches the fraction used in the module docstring's own
+    # worked numbers — NOT independently tuned, since this is a diagnostic,
+    # not a threshold decision.
+    EDGE_SHARPNESS_EDGE_FRACTION: float = 0.12
 
     # CORS (MF DOOM review, 2026-07-16): DEFAULT EMPTY = middleware not
     # attached at all — no CORS headers, no wildcard attack surface. The
@@ -581,24 +626,63 @@ class Settings(BaseSettings):
     # nothing to catch that with.
     #
     # DEFAULT DISABLED (unlike GEOMETRY_CHECK_ENABLED, which had 14 real
-    # calibration samples before defaulting on): this repo has ZERO real
-    # duplicate-photo pairs from egaz-02 traffic to verify DEDUP_PHASH_
-    # HAMMING_MAX against — the value below is the literature default for
-    # "very likely the same source image" (imagehash-family pHash
-    # comparisons), not measured on this camera/compression pipeline. It is
-    # ALSO the reason the existing test suite (tests/test_pad_check.py and
-    # friends) reuses one fixed synthetic image across many tests with
-    # DIFFERENT transaction_ref values — flipping this on by default would
-    # make those tests fail on an unrelated PR, not just the ones testing
-    # dedup. Recommend: enable after this report is reviewed AND after
-    # collecting a small known-duplicate vs known-different photo-pair
-    # sample from real traffic to sanity-check the threshold, same
-    # "не занижай FAR" bar every other threshold in this file is held to.
+    # calibration samples before defaulting on): still no pHash pairs from
+    # LIVE egaz-02 traffic — everything below is calibrated on
+    # `faces-dataset/` (a Telegram-group scrape used elsewhere in this repo
+    # for the resolution gate) plus one real confirmed-fraud sample, NOT
+    # production requests. Recommend: enable once this is reviewed; the
+    # evidence below is meaningfully stronger than a literature default now,
+    # but still not live-traffic-verified. Also STILL the reason the
+    # existing test suite (tests/test_pad_check.py and friends) reuses one
+    # fixed synthetic image across many tests with DIFFERENT
+    # transaction_ref values — flipping this on by default would make those
+    # tests fail on an unrelated PR, not just the ones testing dedup.
+    #
+    # CALIBRATION (RZA, 2026-07-21) — two independent checks, both against
+    # `app/dedup_store.py::compute_phash`:
+    #
+    # 1. Real confirmed-fraud sample (`faces-dataset/real-fakes/
+    #    real_fake_01.jpg` + `real_fake_01_dup.jpg` — a genuine live-person
+    #    photo, byte-identical copy, the exact "one photo reused across many
+    #    sales" incident this feature exists for): hamming=0 for the exact
+    #    duplicate, and STILL <=4 after simulating realistic re-share
+    #    transformations on the original — re-JPEG at quality 30/50/70
+    #    (hamming 0-2), resize to 60% + re-encode (hamming 0), re-encoded to
+    #    the SAME shape as this repo's own Telegram-preview dataset (max
+    #    800px side, hamming 0), and a mild brightness/contrast shift
+    #    (hamming 4). A 3% edge crop already breaks it (hamming 6); a >=5%
+    #    crop or a ~2 degree rotation breaks it further (hamming 6-24) — see
+    #    limitation below.
+    # 2. False-collision floor, `faces-dataset/` (real/+fake/, 199 files):
+    #    67 of those 199 files turned out to be exact BYTE duplicates of
+    #    each other (re-forwarded copies collected more than once by the
+    #    scrape) — collapsed to 67 MD5-DISTINCT source photos first, then
+    #    every pairwise pHash hamming distance was computed across all
+    #    2,211 distinct-photo pairs: min=12, mean=30.6. Every one of those
+    #    2,211 pairs is a DIFFERENT person/photo and none of them come
+    #    anywhere near the old default (4).
+    #
+    # DEDUP_PHASH_HAMMING_MAX raised 4 -> 8 (RZA, 2026-07-21) on the
+    # strength of #2 above: 8 still leaves a 4-bit margin below the
+    # nearest observed different-photo collision (12), while additionally
+    # catching the mild rotation case from #1 (hamming 6) that the old
+    # default of 4 missed. It does NOT catch a deliberate >=5% crop
+    # (hamming 8-24) — see limitation below.
     DEDUP_ENABLED: bool = False
     # Hamming distance (out of 64 bits) below which two pHashes count as
-    # "the same photo" for the HARD BLOCK path. UNCALIBRATED on this
-    # service's real frames (see above) — 4 is the literature default.
-    DEDUP_PHASH_HAMMING_MAX: int = 4
+    # "the same photo" for the HARD BLOCK path. See the calibration note
+    # above for the real numbers behind 8 (raised from the literature
+    # default of 4). KNOWN LIMITATION: pHash (a low-frequency DCT layout
+    # hash) is NOT crop/rotation-invariant — a fraudster who deliberately
+    # crops >=5% off an edge or rotates a couple degrees before each resend
+    # defeats this specific check (confirmed empirically, see above). This
+    # is why the AdaFace-embedding alert below exists as a SEPARATE,
+    # crop/rotation-tolerant signal — see DEDUP_EMBEDDING_ALERT_ENABLED —
+    # and why the real, reliable defense against a genuine-live-person
+    # photo being replayed is an ACTIVE liveness challenge, not any
+    # image-similarity check; see docs/plans/HANDOFF-2026-07-21-
+    # cross-transaction-face-reuse.md.
+    DEDUP_PHASH_HAMMING_MAX: int = 8
     # Retention window for both the pHash dedup table and the
     # inspector-activity table (see app/dedup_store.py). 90 days chosen to
     # match the task's own retention ask; NOT independently derived from a
