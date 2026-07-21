@@ -260,6 +260,196 @@ class TestPadCheckGeometryLayer:
 
 
 # ---------------------------------------------------------------------------
+# POST /pad/check — Layer 0c deterministic frame-sharpness gate (RZA, 2026-07-21)
+# ---------------------------------------------------------------------------
+
+def _make_blurry_base64_image(width: int = 200, height: int = 200) -> str:
+    """Flat-color image — Laplacian variance well below MIN_FACE_SHARPNESS_224
+    (60.0), stands in for a smeared/motion-blurred attack frame."""
+    return _make_base64_image(width, height)  # the default fixture is already flat/low-detail
+
+
+def _make_sharp_base64_image(width: int = 200, height: int = 200) -> str:
+    """Textured image — Laplacian variance well above MIN_FACE_SHARPNESS_224,
+    stands in for a real in-focus face crop."""
+    rng = np.random.default_rng(42)
+    img = np.zeros((height, width, 3), dtype=np.uint8)
+    cv2.circle(img, (width // 2, height // 2), min(width, height) // 3, (200, 180, 160), -1)
+    noise = rng.integers(-30, 30, size=img.shape, dtype=np.int16)
+    img = np.clip(img.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+    _, buf = cv2.imencode(".jpg", img)
+    return base64.b64encode(buf.tobytes()).decode()
+
+
+class TestPadCheckSharpnessLayer:
+    def test_disabled_by_default_never_blocks_blurry_frame(self, client):
+        """FRAME_SHARPNESS_CHECK_ENABLED defaults to False (see app/config.py
+        for why: n=1 subject calibration, existing test fixtures reuse a
+        flat/low-detail synthetic image) — a blurry frame must still fall
+        through to passive-PAD unchanged."""
+        resp = client.post("/pad/check", json={
+            "correlation_id": "test-sharp-disabled",
+            "transaction_type": "sale",
+            "transaction_ref": "req:bal",
+            "face_photo": _make_blurry_base64_image(),
+        })
+        assert resp.status_code == 200
+        assert resp.json()["verdict"] == "live"  # mocked passive-PAD, gate never ran
+
+    def test_enabled_blurry_frame_short_circuits_to_low_quality(self, client):
+        """FRAME_SHARPNESS_CHECK_ENABLED=True + a below-threshold frame =>
+        verdict=low_quality, reason=BLURRY, WITHOUT ever calling passive-PAD
+        (engine.predict) — mirrors TestPadCheckGeometryLayer's pattern."""
+        import app.main as m
+
+        m.settings.FRAME_SHARPNESS_CHECK_ENABLED = True
+        try:
+            with patch.object(m.engine, "predict") as mock_predict:
+                resp = client.post("/pad/check", json={
+                    "correlation_id": "test-sharp-blocked",
+                    "transaction_type": "sale",
+                    "transaction_ref": "req:bal",
+                    "face_photo": _make_blurry_base64_image(),
+                })
+            mock_predict.assert_not_called()
+        finally:
+            m.settings.FRAME_SHARPNESS_CHECK_ENABLED = False
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["verdict"] == "low_quality"
+        assert data["reason"] == "BLURRY"
+        assert data["save_frame"] is False
+        assert "sharpness_check" in data["signals"]
+
+    def test_enabled_sharp_frame_falls_through_to_passive_pad(self, client):
+        """A textured (non-blurry) frame must NOT be rejected by this layer
+        even when enabled — passive-PAD's mocked verdict is what's returned."""
+        import app.main as m
+
+        m.settings.FRAME_SHARPNESS_CHECK_ENABLED = True
+        try:
+            resp = client.post("/pad/check", json={
+                "correlation_id": "test-sharp-pass",
+                "transaction_type": "sale",
+                "transaction_ref": "req:bal",
+                "face_photo": _make_sharp_base64_image(),
+            })
+        finally:
+            m.settings.FRAME_SHARPNESS_CHECK_ENABLED = False
+
+        assert resp.status_code == 200
+        assert resp.json()["verdict"] == "live"
+
+
+# ---------------------------------------------------------------------------
+# POST /pad/check — Layer 0d face-angle gate (RZA, 2026-07-21)
+# ---------------------------------------------------------------------------
+
+class TestPadCheckPoseLayer:
+    def test_disabled_by_default_is_noop_even_with_landmark_detector_present(self, client):
+        """POSE_CHECK_ENABLED defaults to False — even if a landmark_detector
+        happened to be loaded, this layer must not run."""
+        import app.main as m
+
+        mock_landmark = MagicMock()
+        mock_landmark.analyze.return_value = MagicMock(pose_yaw=80.0, pose_pitch=0.0)
+        m.landmark_detector = mock_landmark
+        m._liveness_models_loaded = True
+        try:
+            resp = client.post("/pad/check", json={
+                "correlation_id": "test-pose-disabled",
+                "transaction_type": "sale",
+                "transaction_ref": "req:bal",
+                "face_photo": _make_base64_image(),
+            })
+        finally:
+            m.landmark_detector = None
+            m._liveness_models_loaded = False
+
+        assert resp.status_code == 200
+        assert resp.json()["verdict"] == "live"
+        mock_landmark.analyze.assert_not_called()
+
+    def test_enabled_but_landmark_detector_missing_fails_open(self, client):
+        """POSE_CHECK_ENABLED=True but landmark_detector is None (
+        LIVENESS_ENDPOINTS_ENABLED never turned on) — silent no-op per
+        app/pose_check.py's documented limitation, falls through unchanged."""
+        import app.main as m
+
+        m.settings.POSE_CHECK_ENABLED = True
+        try:
+            resp = client.post("/pad/check", json={
+                "correlation_id": "test-pose-no-detector",
+                "transaction_type": "sale",
+                "transaction_ref": "req:bal",
+                "face_photo": _make_base64_image(),
+            })
+        finally:
+            m.settings.POSE_CHECK_ENABLED = False
+
+        assert resp.status_code == 200
+        assert resp.json()["verdict"] == "live"
+
+    def test_enabled_off_angle_short_circuits_to_low_quality(self, client):
+        """POSE_CHECK_ENABLED=True + landmark_detector reporting an off-angle
+        face => verdict=low_quality, reason=OFF_ANGLE, WITHOUT ever calling
+        passive-PAD (engine.predict)."""
+        import app.main as m
+
+        mock_landmark = MagicMock()
+        mock_landmark.analyze.return_value = MagicMock(pose_yaw=55.0, pose_pitch=0.0)
+        m.landmark_detector = mock_landmark
+        m._liveness_models_loaded = True
+        m.settings.POSE_CHECK_ENABLED = True
+        try:
+            with patch.object(m.engine, "predict") as mock_predict:
+                resp = client.post("/pad/check", json={
+                    "correlation_id": "test-pose-blocked",
+                    "transaction_type": "sale",
+                    "transaction_ref": "req:bal",
+                    "face_photo": _make_base64_image(),
+                })
+            mock_predict.assert_not_called()
+        finally:
+            m.settings.POSE_CHECK_ENABLED = False
+            m.landmark_detector = None
+            m._liveness_models_loaded = False
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["verdict"] == "low_quality"
+        assert data["reason"] == "OFF_ANGLE"
+        assert data["save_frame"] is False
+        assert data["signals"]["pose_check"]["pose_yaw"] == pytest.approx(55.0)
+
+    def test_enabled_frontal_falls_through_to_passive_pad(self, client):
+        """A frontal (in-threshold) pose must NOT be rejected by this layer
+        even when enabled — passive-PAD's mocked verdict is what's returned."""
+        import app.main as m
+
+        mock_landmark = MagicMock()
+        mock_landmark.analyze.return_value = MagicMock(pose_yaw=2.0, pose_pitch=-1.0)
+        m.landmark_detector = mock_landmark
+        m._liveness_models_loaded = True
+        m.settings.POSE_CHECK_ENABLED = True
+        try:
+            resp = client.post("/pad/check", json={
+                "correlation_id": "test-pose-pass",
+                "transaction_type": "sale",
+                "transaction_ref": "req:bal",
+                "face_photo": _make_base64_image(),
+            })
+        finally:
+            m.settings.POSE_CHECK_ENABLED = False
+            m.landmark_detector = None
+            m._liveness_models_loaded = False
+
+        assert resp.status_code == 200
+        assert resp.json()["verdict"] == "live"
+
+
+# ---------------------------------------------------------------------------
 # POST /pad/check — Layer 0b document/passport-photo pre-filter (minicpm-v)
 # ---------------------------------------------------------------------------
 

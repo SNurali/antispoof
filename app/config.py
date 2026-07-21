@@ -155,6 +155,58 @@ class Settings(BaseSettings):
     # not read it as an active threshold today.
     FACE_WIDTH_RATIO_REJECT: float = 0.55
 
+    # Layer 0c — deterministic frame-sharpness gate (RZA, 2026-07-21). See
+    # app/blur_check.py module docstring for the full rationale (a printed/
+    # screen photo held at an angle AND deliberately motion-blurred was
+    # observed passing /pad/check as verdict=live) and calibration numbers.
+    # Dependency-free like GEOMETRY_CHECK_ENABLED (reuses the RetinaFace bbox
+    # already computed, pure OpenCV, no extra model/network call) — but
+    # DEFAULT DISABLED, UNLIKE that gate: GEOMETRY_CHECK_ENABLED had n=14
+    # calibration samples across bonafide+2 spoof profiles before defaulting
+    # on; this gate has n=1 subject / n=8 bona fide frames from ONE staged
+    # capture, and the blur values it was checked against are SYNTHETIC
+    # (motion-blur kernel applied in this repo), not the real production
+    # attack photo. Also: this repo's existing /pad/check + /spoof-server
+    # test suites (tests/test_pad_check.py, test_spoof_server.py,
+    # test_dedup.py) reuse a flat-color synthetic circle image across many
+    # tests that measures well below MIN_FACE_SHARPNESS_224 — the SAME
+    # "would break the existing test suite's shared fixture on an unrelated
+    # PR" reasoning DEDUP_ENABLED below is held to. Recommend: enable after
+    # this report is reviewed AND after collecting a broader bona fide
+    # corpus (n>1 subject) to check MIN_FACE_SHARPNESS_224 against, and
+    # after fixing the synthetic test fixtures — same "не занижай FAR" bar,
+    # applied to not silently raising FRR without real data behind it either.
+    FRAME_SHARPNESS_CHECK_ENABLED: bool = False
+    # Laplacian variance floor on a 224x224 resize of the face bbox crop
+    # (same crop scale app/multisignal.py::recapture_spoof_score already
+    # uses). Below this -> reject as low_quality/BLURRY, before passive-PAD
+    # runs. See app/blur_check.py docstring for the 93.0 (sharp bona fide
+    # floor) vs 25.6-89.4 (same frames, synthetic 9px motion blur) numbers
+    # this sits between.
+    MIN_FACE_SHARPNESS_224: float = 60.0
+
+    # Layer 0d — face-angle (yaw/pitch) gate (RZA, 2026-07-21). See
+    # app/pose_check.py module docstring for the full rationale and
+    # calibration numbers (s001, n=1 subject).
+    # DEFAULT DISABLED, unlike the sharpness gate above: this one requires
+    # LandmarkDetector (SCRFD + landmark_3d_68, insightface) which is ONLY
+    # loaded when LIVENESS_ENDPOINTS_ENABLED=True — flipping this on without
+    # that flag (and without buffalo_l weights actually provisioned on the
+    # host) is a silent no-op, not a security control; see app/main.py::
+    # _run_pose_gate for the exact guard. Even with both flags true, this
+    # adds ~100-160ms CPU (a second detector pass) inside /pad/check's
+    # existing 2.0s INFERENCE_TIMEOUT_S budget — confirm real p95 latency on
+    # egaz-02 before enabling in prod.
+    POSE_CHECK_ENABLED: bool = False
+    # Max |yaw| degrees before a frame is rejected as off-angle. s001 bona
+    # fide "30-degree" turns measured ~32-33 actual — 40.0 leaves ~7 degrees
+    # margin, THIN on n=1 subject. See app/pose_check.py docstring.
+    POSE_YAW_REJECT_DEG: float = 40.0
+    # Max |pitch| degrees before a frame is rejected as off-angle. s001 bona
+    # fide up/down tilts measured ~35-37 actual — 45.0 leaves ~8 degrees
+    # margin for an ordinary checkout glance. See app/pose_check.py.
+    POSE_PITCH_REJECT_DEG: float = 45.0
+
     # CORS (MF DOOM review, 2026-07-16): DEFAULT EMPTY = middleware not
     # attached at all — no CORS headers, no wildcard attack surface. The
     # real production caller is server-side Laravel (not a browser), so CORS

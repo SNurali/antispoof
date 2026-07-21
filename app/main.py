@@ -39,6 +39,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.active_challenge import verify_challenge
+from app.blur_check import SharpnessCheckResult, check_face_sharpness
 from app.config import Settings, resolve_device
 from app.dedup_store import build_dedup_store, compute_phash
 from app.document_check import DocumentPhotoChecker
@@ -46,6 +47,7 @@ from app.face_detect import FaceDetector
 from app.frame_qc import assess_frame
 from app.geometry_check import GeometryCheckResult, check_face_geometry
 from app.identity_consistency import compute_identity_consistency
+from app.pose_check import PoseCheckResult, check_face_pose
 from app.liveness import LivenessEngine
 from app.liveness_session import (
     StepWindowDict,
@@ -568,6 +570,75 @@ def _geometry_signals(geo_result: GeometryCheckResult) -> dict:
     }
 
 
+def _run_sharpness_gate(bbox: list[int], image_bgr: np.ndarray) -> Optional[SharpnessCheckResult]:
+    """Layer 0c — shared frame-sharpness gate (RZA, 2026-07-21).
+
+    Reuses the SAME bbox already computed for passive-PAD/geometry — no
+    extra model. See app/blur_check.py for the full rationale (blur is one
+    half of the reported angle+blur bypass) and calibration numbers.
+
+    Returns the `SharpnessCheckResult` when the gate fired (caller should
+    short-circuit to its own low_quality/BLURRY response), or `None` when
+    disabled, did not run (bad input), or did not flag the frame (caller
+    falls through unchanged). Never raises.
+    """
+    if not settings.FRAME_SHARPNESS_CHECK_ENABLED:
+        return None
+    result = check_face_sharpness(bbox, image_bgr, settings.MIN_FACE_SHARPNESS_224)
+    if result.ran and result.is_blurry:
+        return result
+    return None
+
+
+def _sharpness_signals(result: SharpnessCheckResult) -> dict:
+    """Build the `signals` sub-dict shape used across endpoints for a sharpness-gate hit."""
+    return {"sharpness_check": {"sharpness": result.sharpness, "threshold": settings.MIN_FACE_SHARPNESS_224}}
+
+
+def _run_pose_gate(image_bgr: np.ndarray) -> Optional[PoseCheckResult]:
+    """Layer 0d — face-angle gate (RZA, 2026-07-21). See app/pose_check.py
+    for the full rationale and calibration numbers.
+
+    Fails open (returns None) unless BOTH `settings.POSE_CHECK_ENABLED` AND
+    the landmark_detector singleton actually loaded (requires
+    `LIVENESS_ENDPOINTS_ENABLED=True` at startup, app/main.py::
+    _load_liveness_models) — see app/pose_check.py's "DEFAULT DISABLED"
+    limitation for why this is a silent no-op, not a security control, when
+    either precondition is missing. Any exception from the detector itself
+    (e.g. a corrupt/edge-case frame) is caught and logged, never raised —
+    same fail-safe-to-passive-PAD pattern as the geometry/sharpness gates,
+    which are dependency-free and therefore cannot fail this way.
+    """
+    if not settings.POSE_CHECK_ENABLED or not _liveness_models_loaded or landmark_detector is None:
+        return None
+    try:
+        face = landmark_detector.analyze(image_bgr)
+    except Exception:
+        log.exception("pose gate: landmark_detector.analyze() failed — failing open to passive-PAD")
+        return None
+    if face is None:
+        return None
+    result = check_face_pose(
+        face.pose_yaw, face.pose_pitch,
+        settings.POSE_YAW_REJECT_DEG, settings.POSE_PITCH_REJECT_DEG,
+    )
+    if result.ran and result.is_off_angle:
+        return result
+    return None
+
+
+def _pose_signals(result: PoseCheckResult) -> dict:
+    """Build the `signals` sub-dict shape used across endpoints for a pose-gate hit."""
+    return {
+        "pose_check": {
+            "pose_yaw": result.pose_yaw,
+            "pose_pitch": result.pose_pitch,
+            "yaw_threshold": settings.POSE_YAW_REJECT_DEG,
+            "pitch_threshold": settings.POSE_PITCH_REJECT_DEG,
+        }
+    }
+
+
 def _run_single(image_bgr: np.ndarray) -> dict:
     """Detect face + (Layer 0a geometry gate) + predict liveness for a single image."""
     bbox = detector.detect(image_bgr)
@@ -589,6 +660,17 @@ def _run_single(image_bgr: np.ndarray) -> dict:
             "threshold": settings.FACE_RATIO_REJECT,
             "face_detected": True,
             "signals": _geometry_signals(geo_result),
+        }
+
+    sharp_result = _run_sharpness_gate(bbox, image_bgr)
+    if sharp_result is not None:
+        return {
+            "is_real": False,
+            "label": "blurry",
+            "score": round(sharp_result.sharpness, 4),
+            "threshold": settings.MIN_FACE_SHARPNESS_224,
+            "face_detected": True,
+            "signals": _sharpness_signals(sharp_result),
         }
 
     label, score, face_detected, signal_info = engine.predict(image_bgr, bbox)
@@ -703,6 +785,18 @@ async def verify_batch(images: list[UploadFile] = File(...)) -> dict:
                     "threshold": settings.FACE_RATIO_REJECT,
                     "face_detected": True,
                     "signals": _geometry_signals(geo_result),
+                }
+                continue
+
+            sharp_result = _run_sharpness_gate(bbox, img)
+            if sharp_result is not None:
+                results[i] = {
+                    "is_real": False,
+                    "label": "blurry",
+                    "score": round(sharp_result.sharpness, 4),
+                    "threshold": settings.MIN_FACE_SHARPNESS_224,
+                    "face_detected": True,
+                    "signals": _sharpness_signals(sharp_result),
                 }
                 continue
 
@@ -840,7 +934,10 @@ class PadCheckResponse(BaseModel):
     verdict: Literal["live", "spoof", "low_quality"] = Field(...)
     reason: Optional[str] = Field(
         None,
-        description="PASSIVE_PAD_SPOOF | DOCUMENT_PHOTO | NO_FACE | LOW_QUALITY | TIMEOUT | INTERNAL_ERROR | null",
+        description=(
+            "PASSIVE_PAD_SPOOF | DOCUMENT_PHOTO | BLURRY | OFF_ANGLE | DUPLICATE_PHOTO | "
+            "NO_FACE | LOW_QUALITY | TIMEOUT | INTERNAL_ERROR | null"
+        ),
     )
     score: float = Field(..., description="Confidence score [0..1]")
     threshold: float = Field(..., description="Liveness threshold used for this decision")
@@ -1081,6 +1178,71 @@ async def pad_check(
             save_frame=True, signals=geo_signals, model_version=MODEL_VERSION, processing_ms=ms,
         )
     # Below threshold, not ran (disabled or bad input) — continue unchanged.
+
+    # Layer 0c — deterministic frame-sharpness gate (RZA, 2026-07-21). Runs
+    # BEFORE passive-PAD, same bbox, no extra model — see app/blur_check.py.
+    # verdict=low_quality (not spoof): a blurry SINGLE frame alone is not
+    # independently confirmed as a fraud attempt (an honest customer's shaky
+    # camera looks the same to this gate) — same "reshoot, don't accuse"
+    # posture app/frame_qc.py already uses for the multi-frame session path.
+    # Blocking the "live" verdict is what actually matters for the money
+    # path: a blurry attack frame can never reach verdict=live through here.
+    sharp_result = _run_sharpness_gate(bbox, img)
+    if sharp_result is not None:
+        ms = round((time.perf_counter() - t0) * 1000, 1)
+        sharp_signals = _sharpness_signals(sharp_result)
+        _audit_entry(
+            req.correlation_id, req.transaction_type, req.transaction_ref,
+            "low_quality", sharp_result.sharpness, sharp_signals, ms, False, reason="BLURRY",
+        )
+        log.info(
+            "PAD check: correlation=%s verdict=low_quality reason=BLURRY "
+            "sharpness=%.1f ms=%.1f txn=%s",
+            req.correlation_id, sharp_result.sharpness, ms, req.transaction_ref,
+        )
+        return PadCheckResponse(
+            verdict="low_quality", reason="BLURRY", score=round(sharp_result.sharpness, 4),
+            threshold=settings.MIN_FACE_SHARPNESS_224, face_detected=True,
+            save_frame=False, signals=sharp_signals, model_version=MODEL_VERSION, processing_ms=ms,
+        )
+    # Below threshold, not ran (disabled or bad input) — continue unchanged.
+
+    # Layer 0d — face-angle gate (RZA, 2026-07-21). DEFAULT DISABLED
+    # (settings.POSE_CHECK_ENABLED) — see app/pose_check.py for why. When
+    # enabled, runs a SECOND detector (SCRFD+landmark_3d_68) under its own
+    # bounded timeout so a slow/stuck pose pass cannot blow past
+    # INFERENCE_TIMEOUT_S's 2.0s budget for the passive-PAD call that follows
+    # it; a timeout here fails OPEN (falls through to passive-PAD unchanged,
+    # same as a disabled/no-landmark result), it never turns into an error
+    # response — this gate is additive hardening, not a new failure mode.
+    # verdict=low_quality (not spoof), same reasoning as the sharpness gate
+    # above: an off-angle frame alone is not independently confirmed fraud.
+    if settings.POSE_CHECK_ENABLED:
+        try:
+            pose_result = await asyncio.wait_for(
+                asyncio.to_thread(_run_pose_gate, img), timeout=INFERENCE_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            log.warning("pose gate: timeout for correlation=%s — failing open to passive-PAD", req.correlation_id)
+            pose_result = None
+        if pose_result is not None:
+            ms = round((time.perf_counter() - t0) * 1000, 1)
+            pose_signals = _pose_signals(pose_result)
+            _audit_entry(
+                req.correlation_id, req.transaction_type, req.transaction_ref,
+                "low_quality", 0.0, pose_signals, ms, False, reason="OFF_ANGLE",
+            )
+            log.info(
+                "PAD check: correlation=%s verdict=low_quality reason=OFF_ANGLE "
+                "yaw=%.1f pitch=%.1f ms=%.1f txn=%s",
+                req.correlation_id, pose_result.pose_yaw, pose_result.pose_pitch, ms, req.transaction_ref,
+            )
+            return PadCheckResponse(
+                verdict="low_quality", reason="OFF_ANGLE", score=0.0,
+                threshold=settings.POSE_YAW_REJECT_DEG, face_detected=True,
+                save_frame=False, signals=pose_signals, model_version=MODEL_VERSION, processing_ms=ms,
+            )
+    # Below threshold, disabled, or landmark_detector unavailable — continue unchanged.
 
     # Layer 0b — document/passport-photo pre-filter via minicpm-v (runs BEFORE
     # passive-PAD). DEFAULT DISABLED (see app/document_check.py for why).
