@@ -406,8 +406,40 @@ class Settings(BaseSettings):
     # FAR for a good-looking number" trap the honesty rules warn against.
     # Detection stays reachable (a caller can put "BLINK" in a session's
     # own steps) for exactly this future recalibration to build on, without
-    # a second implementation pass.
-    LIVENESS_CHALLENGE_STEPS_POOL: str = "TURN_LEFT,TURN_RIGHT"
+    # a second implementation pass. SMILE is excluded for the identical
+    # reason (LIVENESS_MAR_SMILE_MIN below is an even weaker placeholder
+    # than BLINK's — see that constant's docstring).
+    #
+    # NOD_UP/NOD_DOWN ADDED TO THE POOL (RZA, 2026-07-21, owner request: 4
+    # actions — left/right/up/down). Unlike BLINK/SMILE, NOD's pitch axis
+    # has REAL device-captured evidence behind it: the s001 calibration rig
+    # (`app/pose_check.py` docstring, 2026-07-21, ONE subject, real video
+    # frames through the SAME landmark_3d_68 pose the FrameFace.pose_pitch
+    # this challenge reads comes from) recorded an intentional "look up"
+    # tilt at pitch=36.88 and an intentional "look down" tilt at
+    # pitch=-34.08 — the SAME order of magnitude and the SAME "nominal
+    # label vs. measured value runs a bit wider" pattern already accepted
+    # for TURN_LEFT/TURN_RIGHT's own yaw calibration (s001 "30-degree" turns
+    # measured ~32-33 actual). This is a materially stronger evidence bar
+    # than BLINK (zero real closed-eye frames in this repo) or SMILE (zero
+    # real smiling frames) ever had, which is why NOD graduates into the
+    # pool here while BLINK/SMILE do not. It is still NOT the same as a
+    # dedicated "on-command nod during an active challenge" capture (s001
+    # was a generic pose-angle calibration rig, not this feature's own
+    # test) and it is still n=1 subject — see LIVENESS_PITCH_NOD_MIN_DEG
+    # below for the full threshold rationale and the sign-convention
+    # caveat this inherits from TURN_LEFT/TURN_RIGHT (app/active_challenge.py
+    # module docstring).
+    #
+    # With the pool now at 4 items (TURN_LEFT, TURN_RIGHT, NOD_UP, NOD_DOWN)
+    # and LIVENESS_CHALLENGE_STEP_COUNT_MIN/_MAX=3/4 below, the clamp
+    # `hi=min(step_count_max, len(pool))`/`lo=min(step_count_min, hi)`
+    # (app/liveness_session.py::generate_challenge_spec) no longer collapses
+    # to a fixed k — production sessions now genuinely sample k in {3, 4}
+    # from these 4 steps, for the first time since that range was
+    # introduced (previously the 2-item pool clamped k=2 deterministically,
+    # see that function's own docstring, now stale on this specific point).
+    LIVENESS_CHALLENGE_STEPS_POOL: str = "TURN_LEFT,TURN_RIGHT,NOD_UP,NOD_DOWN"
     # How many steps to sample from the pool per session — a RANGE, not a
     # fixed count (Challenge Entropy sprint, CHALLENGE_ENTROPY_SPRINT_v1.md
     # §5.1, requirement dictated by Rustam's review §1 p.1). Replaces the old
@@ -442,25 +474,83 @@ class Settings(BaseSettings):
     # center. Placeholder, not calibrated.
     LIVENESS_YAW_FRONTAL_MAX_DEG: float = 10.0
 
-    # NOD_UP/NOD_DOWN (CHALLENGE_ENTROPY_SPRINT_v1.md §4.1, Фаза 1) —
-    # required |pitch| deviation (degrees) for a nod step to count as
-    # satisfied, symmetric to LIVENESS_YAW_TURN_MIN_DEG above but on the
-    # pitch axis (`FrameFace.pose_pitch`, same landmark_3d_68 pass, no new
-    # inference — see app/active_challenge.py module docstring). Carried
-    # over the SAME 20.0 literature/ML_CORE number used for yaw, UNVERIFIED
-    # against a real device — the sign-convention caveat already documented
-    # for TURN_LEFT/TURN_RIGHT (app/active_challenge.py) applies here
-    # identically: which physical direction ("chin up" vs "chin down") maps
-    # to positive pitch has NOT been confirmed with a labeled real capture.
-    # If the sign is backwards, NOD_UP/NOD_DOWN swap meaning but the
-    # security property (some real pitch rotation happened) still holds.
-    # No separate "frontal" threshold is introduced for pitch — the
-    # existing global has_frontal gate below stays yaw-only, same as it
-    # already is for BLINK (this is a deliberate scope decision, not an
-    # oversight: NOD's own evidence-frame check does not require
+    # NOD_UP/NOD_DOWN (CHALLENGE_ENTROPY_SPRINT_v1.md §4.1, Фаза 1;
+    # RE-CALIBRATED 2026-07-21 for pool inclusion, RZA) — required |pitch|
+    # deviation (degrees) for a nod step to count as satisfied, symmetric to
+    # LIVENESS_YAW_TURN_MIN_DEG above but on the pitch axis
+    # (`FrameFace.pose_pitch`, same landmark_3d_68 pass, no new inference —
+    # see app/active_challenge.py module docstring).
+    #
+    # LOWERED 20.0 -> 18.0 (RZA, 2026-07-21): the original 20.0 was a blind
+    # copy of the yaw literature number with NO pitch-specific evidence
+    # behind it at all. Real evidence now exists — s001 (`app/pose_check.py`
+    # docstring, ONE subject, real captured video frames, same
+    # landmark_3d_68 pose convention): intentional "look up" measured
+    # pitch=36.88, intentional "look down" measured pitch=-34.08. 18.0
+    # clears both with a wide margin (36.88-18=18.9deg / ~51%, 34.08-18=16.1deg
+    # / ~47%) — deliberately MORE margin than TURN_LEFT/TURN_RIGHT's own
+    # 20.0-vs-~32.79 gap (~39%), not less, because the pitch evidence is
+    # thinner: s001 only recorded ONE nod-like magnitude per direction (no
+    # "nod15"/"nod30" step ladder the way yaw got right15/left15/right30/
+    # left30) — there is no data point confirming this threshold still
+    # clears a smaller, more casual real nod the way TURN_MIN was confirmed
+    # against BOTH a 15-degree and a 30-degree real yaw. 18.0 (not lower,
+    # e.g. 15.0) is chosen to keep a comfortable gap above ordinary
+    # checkout-glance jitter (s001 frontal frames measured pitch=3.52,
+    # nowhere near either candidate value, so this is not a knife-edge
+    # choice either way) while staying honestly labeled as a REASONABLE
+    # ESTIMATE, not a final calibration — same bar already applied to
+    # LIVENESS_YAW_TURN_MIN_DEG. CONFIRM ON A REAL DEVICE before trusting
+    # this as a tuned FRR bound for the general population (children,
+    # elderly, wheelchair users, etc. were not in s001's n=1 sample).
+    #
+    # SIGN CONVENTION: the sign-convention caveat already documented for
+    # TURN_LEFT/TURN_RIGHT (app/active_challenge.py module docstring)
+    # applies here at the SAME confidence level, not a lower one — s001's
+    # "up (tilt)"/"down (tilt)" labels DO align with this constant's
+    # assumption (positive pitch = chin up = NOD_UP; negative = chin down =
+    # NOD_DOWN), which is mildly supportive, but the s001 capture's own
+    # left/right-turn labels ALREADY align with TURN_LEFT/TURN_RIGHT's
+    # assumption too and that was STILL judged "not confirmed" (the
+    # labeling protocol used during that capture — camera-observed vs.
+    # subject-self-reported direction — is not preserved/reviewable in this
+    # repo, only the aggregate numbers in the docstring are). Applying a
+    # different, more confident bar to pitch just because the numbers
+    # happen to line up would be inconsistent, not more honest. If the sign
+    # is backwards, NOD_UP/NOD_DOWN swap meaning but the security property
+    # (some real pitch rotation happened, in the requested order) still
+    # holds — see app/active_challenge.py.
+    #
+    # No separate "frontal" threshold is wired into the server's
+    # has_frontal gate for pitch — that gate stays yaw-only, same as it
+    # already is for BLINK (this is a deliberate scope decision carried
+    # over unchanged: NOD's own evidence-frame check does not require
     # frontality, mirroring how TURN_LEFT/TURN_RIGHT's evidence frame is
-    # never itself "frontal" either).
-    LIVENESS_PITCH_NOD_MIN_DEG: float = 20.0
+    # never itself "frontal" either). LIVENESS_PITCH_FRONTAL_MAX_DEG below
+    # is a NEW, separate constant added alongside this one — it exists for
+    # documentation/mobile-spec parity with LIVENESS_YAW_FRONTAL_MAX_DEG,
+    # not because it is read by verify_challenge today. See that constant's
+    # own docstring.
+    LIVENESS_PITCH_NOD_MIN_DEG: float = 18.0
+
+    # Pitch-axis counterpart to LIVENESS_YAW_FRONTAL_MAX_DEG (RZA,
+    # 2026-07-21) — max |pitch| for a frame to count as a "facing the
+    # camera, not tilted" reference. NOT currently read by
+    # app/active_challenge.py::verify_challenge (see
+    # LIVENESS_PITCH_NOD_MIN_DEG's docstring immediately above for why the
+    # server's has_frontal gate deliberately stays yaw-only). This constant
+    # exists so a pitch-frontal number is defined ONCE, in the same place
+    # as every other liveness threshold, for two consumers: (1)
+    # egaz-mobile's local pre-nod frontal check (see
+    # docs/plans/NOD_DETECTION_SPEC_v1.md in that repo, mirrors this exact
+    # value with a margin, the same pattern TURN_DETECTION_SPEC_v1.md
+    # already uses for LIVENESS_YAW_FRONTAL_MAX_DEG); (2) a possible future
+    # server-side tightening of has_frontal to require both axes, an OPEN
+    # decision for the owner, not made here. Set to the SAME 10.0 value as
+    # LIVENESS_YAW_FRONTAL_MAX_DEG for symmetry — s001's own frontal frame
+    # measured pitch=3.52 (`tests/test_pose_check.py`), well inside this
+    # band with margin.
+    LIVENESS_PITCH_FRONTAL_MAX_DEG: float = 10.0
 
     # BLINK closed-eye cutoff for min(right_ear, left_ear) — see
     # app/active_challenge.py + app/face_landmarks.py::eye_aspect_ratios.

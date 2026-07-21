@@ -98,6 +98,31 @@ class TestGenerateChallengeSpec:
         assert seen_k == {3, 4}
         assert len(seen_orderings) > 50  # wide spread, not a handful of repeats
 
+    def test_real_default_settings_pool_actually_randomizes_k(self):
+        """RZA, 2026-07-21: proves the effect at the REAL `Settings()` config
+        layer, not a hand-built pool list like the other tests in this
+        class — before this date the 2-item default pool clamped k=2
+        deterministically (see test_pool_of_two_stays_deterministic_
+        with_min3_max4 above, now a regression guard for that OLD prod
+        shape); with NOD_UP/NOD_DOWN added to
+        LIVENESS_CHALLENGE_STEPS_POOL, prod k genuinely varies now."""
+        from app.config import Settings
+
+        settings = Settings(SERVICE_TOKEN="")
+        pool = [s.strip() for s in settings.LIVENESS_CHALLENGE_STEPS_POOL.split(",") if s.strip()]
+        assert len(pool) == 4
+
+        seen_k = set()
+        for seed in range(100):
+            steps = generate_challenge_spec(
+                pool, settings.LIVENESS_CHALLENGE_STEP_COUNT_MIN,
+                settings.LIVENESS_CHALLENGE_STEP_COUNT_MAX, rng=random.Random(seed),
+            )
+            assert len(steps) in (3, 4)
+            assert set(steps).issubset(set(pool))
+            seen_k.add(len(steps))
+        assert seen_k == {3, 4}
+
     def test_inverted_step_count_range_does_not_raise(self):
         """MEDIUM finding (MF DOOM code review, 2026-07-20): a misconfigured
         LIVENESS_CHALLENGE_STEP_COUNT_MIN > _MAX must not crash

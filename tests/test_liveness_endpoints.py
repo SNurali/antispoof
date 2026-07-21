@@ -32,21 +32,40 @@ def _frame(seq: int) -> dict:
     return {"seq": seq, "base64": _make_base64_image(), "captured_at": None}
 
 
-def _yaw_for_step(step: str) -> float:
-    return 25.0 if step == "TURN_LEFT" else -25.0
+def _pose_for_step(step: str) -> tuple[float, float]:
+    """(yaw, pitch) pair that satisfies `step`'s evidence check in
+    app/active_challenge.py::verify_challenge, with generous margin above
+    every configured threshold (LIVENESS_YAW_TURN_MIN_DEG=20.0,
+    LIVENESS_PITCH_NOD_MIN_DEG=18.0 as of 2026-07-21 — see app/config.py)
+    so a future in-range threshold tweak does not silently break these
+    tests."""
+    return {
+        "TURN_LEFT": (25.0, 0.0),
+        "TURN_RIGHT": (-25.0, 0.0),
+        "NOD_UP": (0.0, 25.0),
+        "NOD_DOWN": (0.0, -25.0),
+    }[step]
 
 
-def _yaws_matching_step_order(steps: list[str]) -> list[float]:
-    """Builds a [frontal, evidence(steps[0]), frontal, evidence(steps[1])]
-    yaw sequence matching WHATEVER order /liveness/challenge actually
-    returned. Phase 3.1 (order-by-evidence, CHALLENGE_ENTROPY_SPRINT_v1.md
-    §6.1) requires each requested step's evidence frame to have a strictly
-    LATER seq than the previous step's — tests can no longer hardcode a
-    fixed TURN_LEFT-then-TURN_RIGHT order now that `steps` order is
-    genuinely randomized (secrets ГСЧ, Фаза 0/2), so callers must build the
-    yaw sequence from the actual `challenge_spec.steps` returned."""
-    assert len(steps) == 2, "helper assumes today's 2-step pool (TURN_LEFT,TURN_RIGHT)"
-    return [0.0, _yaw_for_step(steps[0]), 0.0, _yaw_for_step(steps[1])]
+def _poses_matching_step_order(steps: list[str]) -> list[tuple[float, float]]:
+    """Builds a [frontal, evidence(steps[0]), evidence(steps[1]), ...]
+    (yaw, pitch) sequence matching WHATEVER order/length /liveness/challenge
+    actually returned. Phase 3.1 (order-by-evidence,
+    CHALLENGE_ENTROPY_SPRINT_v1.md §6.1) requires each requested step's
+    evidence frame to have a strictly LATER seq than the previous step's —
+    tests can no longer hardcode a fixed order or a fixed 2-step count now
+    that `steps` is sampled from a 4-item pool (TURN_LEFT/TURN_RIGHT/
+    NOD_UP/NOD_DOWN, app/config.py::LIVENESS_CHALLENGE_STEPS_POOL,
+    2026-07-21) with k genuinely varying in {3, 4}
+    (LIVENESS_CHALLENGE_STEP_COUNT_MIN/_MAX) — build the pose sequence from
+    the actual `challenge_spec.steps` returned instead. ONE leading frontal
+    pose is enough (not one between every step, unlike the old TURN-only
+    2-step version of this helper): `has_frontal` only needs one frontal
+    frame ANYWHERE in the series, and order-by-evidence only needs each
+    step's evidence at a strictly later seq than the previous one's — this
+    keeps the total length (1+k, i.e. 4 or 5) inside
+    [LIVENESS_MIN_FRAMES, LIVENESS_MAX_FRAMES]=[4,6] for both possible k."""
+    return [(0.0, 0.0)] + [_pose_for_step(s) for s in steps]
 
 
 @pytest.fixture(autouse=True)
@@ -62,19 +81,22 @@ def _no_startup():
     app.router.on_startup = original_handlers
 
 
-def _mock_frame_face(yaw=0.0, n_faces=1, bbox_xyxy=(50.0, 50.0, 150.0, 150.0)):
+def _mock_frame_face(yaw=0.0, pitch=0.0, n_faces=1, bbox_xyxy=(50.0, 50.0, 150.0, 150.0)):
     """Default bbox is 100x100 in a 200x200 frame (_make_base64_image's
     default size) => face_area_ratio=0.25, BELOW GEOMETRY_CHECK_ENABLED's
     default FACE_RATIO_REJECT=0.27 (app/config.py) — deliberately chosen so
     existing non-geometry tests don't spuriously trip the Layer 0a gate
     added 2026-07-17. Also satisfies frame_qc.MIN_FACE_EDGE_PX=60 (edge=100).
     Tests that specifically exercise the geometry gate pass a bigger,
-    document-like bbox_xyxy explicitly (see TestLivenessGeometryGate)."""
+    document-like bbox_xyxy explicitly (see TestLivenessGeometryGate).
+    `pitch` added 2026-07-21 alongside NOD_UP/NOD_DOWN joining the default
+    pool — defaults to 0.0 so every pre-existing caller (yaw-only) is
+    unaffected."""
     from app.face_landmarks import FrameFace
     return FrameFace(
         bbox_xyxy=bbox_xyxy,
         kps=np.array([[70, 80], [130, 80], [100, 110], [80, 140], [120, 140]], dtype=np.float32),
-        pose_pitch=0.0, pose_yaw=yaw, pose_roll=0.0, det_score=0.9, n_faces_detected=n_faces,
+        pose_pitch=pitch, pose_yaw=yaw, pose_roll=0.0, det_score=0.9, n_faces_detected=n_faces,
     )
 
 
@@ -163,10 +185,14 @@ class TestChallengeEndpoint:
 
     def test_step_count_within_configured_range(self, client_enabled):
         """Фаза 2 (§5.1): k теперь варьируется в [MIN, MAX], клампленный к
-        размеру пула — с сегодняшним 2-элементным пулом это схлопывается в
-        k=2 детерминированно (см. app/liveness_session.py::
-        generate_challenge_spec docstring), но контракт сам по себе должен
-        соблюдать диапазон, не полагаясь на сегодняшний размер пула."""
+        размеру пула. С 2026-07-21 (NOD_UP/NOD_DOWN в пуле, 4 элемента) это
+        больше НЕ схлопывается в фиксированное k — прод реально сэмплирует
+        k в {3,4} (см. app/liveness_session.py::generate_challenge_spec
+        docstring и tests/test_liveness_session.py::
+        test_real_default_settings_pool_actually_randomizes_k), но этот тест
+        не полагается на конкретный размер пула — контракт сам по себе
+        должен соблюдать диапазон вне зависимости от того, каким пул будет
+        завтра."""
         client, m = client_enabled
         pool_size = len(set(s.strip() for s in m.settings.LIVENESS_CHALLENGE_STEPS_POOL.split(",")))
         expected_min = min(m.settings.LIVENESS_CHALLENGE_STEP_COUNT_MIN, pool_size)
@@ -325,14 +351,14 @@ class TestVerdictEndpoint:
         ch = client.post("/liveness/challenge", json={
             "correlation_id": "c1", "transaction_type": "sale", "transaction_ref": "req1:ball1",
         }).json()
-        # Yaw sequence built from the ACTUAL step order the challenge
+        # Pose sequence built from the ACTUAL step order the challenge
         # returned — order-by-evidence (Phase 3.1) means a hardcoded
         # TURN_LEFT-then-TURN_RIGHT sequence would be flaky now that step
-        # order is genuinely randomized (secrets ГСЧ).
-        yaws = _yaws_matching_step_order(ch["challenge_spec"]["steps"])
-        m.landmark_detector.analyze.side_effect = [_mock_frame_face(yaw=y) for y in yaws]
+        # order/composition is genuinely randomized (secrets ГСЧ, 4-item pool).
+        poses = _poses_matching_step_order(ch["challenge_spec"]["steps"])
+        m.landmark_detector.analyze.side_effect = [_mock_frame_face(yaw=y, pitch=p) for y, p in poses]
 
-        frames = [_frame(i) for i in range(m.settings.LIVENESS_MIN_FRAMES)]
+        frames = [_frame(i) for i in range(len(poses))]
         resp = client.post("/liveness/verdict", json={
             "correlation_id": "c1", "session_id": ch["session_id"], "transaction_type": "sale",
             "transaction_ref": "A_DIFFERENT_SALE_REF", "frames": frames,
@@ -364,10 +390,10 @@ class TestVerdictEndpoint:
         ch = client.post("/liveness/challenge", json={
             "correlation_id": "c1", "transaction_type": "sale", "transaction_ref": "r:b",
         }).json()
-        yaws = _yaws_matching_step_order(ch["challenge_spec"]["steps"])
-        m.landmark_detector.analyze.side_effect = [_mock_frame_face(yaw=y) for y in yaws]
+        poses = _poses_matching_step_order(ch["challenge_spec"]["steps"])
+        m.landmark_detector.analyze.side_effect = [_mock_frame_face(yaw=y, pitch=p) for y, p in poses]
 
-        frames = [_frame(i) for i in range(m.settings.LIVENESS_MIN_FRAMES)]
+        frames = [_frame(i) for i in range(len(poses))]
         resp = client.post("/liveness/verdict", json={
             "correlation_id": "c1", "session_id": ch["session_id"], "transaction_type": "sale",
             "transaction_ref": "r:b", "frames": frames,
@@ -400,11 +426,11 @@ class TestLivenessGeometryGate:
     the document-photo signature (see app/geometry_check.py for the real
     incident_urgut calibration numbers this threshold is based on)."""
 
-    def _document_like_face(self, yaw=0.0):
+    def _document_like_face(self, yaw=0.0, pitch=0.0):
         # bbox 180x180 in a 200x200 frame => face_area_ratio=0.81, far above
         # FACE_RATIO_REJECT=0.27 — same shape of signal as the real
         # passport-style spoof incidents documented in geometry_check.py.
-        return _mock_frame_face(yaw=yaw, bbox_xyxy=(10.0, 10.0, 190.0, 190.0))
+        return _mock_frame_face(yaw=yaw, pitch=pitch, bbox_xyxy=(10.0, 10.0, 190.0, 190.0))
 
     def test_document_like_bbox_flagged_as_spoof(self, client_enabled):
         client, m = client_enabled
@@ -455,10 +481,12 @@ class TestLivenessGeometryGate:
             ch = client.post("/liveness/challenge", json={
                 "correlation_id": "c1", "transaction_type": "sale", "transaction_ref": "r:b",
             }).json()
-            yaws = _yaws_matching_step_order(ch["challenge_spec"]["steps"])
-            m.landmark_detector.analyze.side_effect = [self._document_like_face(yaw=y) for y in yaws]
+            poses = _poses_matching_step_order(ch["challenge_spec"]["steps"])
+            m.landmark_detector.analyze.side_effect = [
+                self._document_like_face(yaw=y, pitch=p) for y, p in poses
+            ]
 
-            frames = [_frame(i) for i in range(m.settings.LIVENESS_MIN_FRAMES)]
+            frames = [_frame(i) for i in range(len(poses))]
             resp = client.post("/liveness/verdict", json={
                 "correlation_id": "c1", "session_id": ch["session_id"], "transaction_type": "sale",
                 "transaction_ref": "r:b", "frames": frames,

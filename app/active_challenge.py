@@ -18,15 +18,24 @@ As of 2026-07-20 (CHALLENGE_ENTROPY_SPRINT_v1.md §4, Фаза 1), also
 NOD_UP/NOD_DOWN (pitch from the SAME landmark_3d_68 pose, symmetric to
 TURN_LEFT/TURN_RIGHT's yaw check) and SMILE (mouth width/height ratio —
 app/face_landmarks.py::mouth_aspect_ratio, SAME landmark_3d_68 raw 68
-points as BLINK, no new model). Same "capability exists, not yet trusted"
-state as BLINK below applies to all three: implemented and reachable via
-SUPPORTED_STEPS, deliberately NOT in the default pool.
+points as BLINK, no new model).
 
-NONE OF THE THREE NEW STEPS ARE IN THE DEFAULT POOL EITHER
-(app/config.py::LIVENESS_CHALLENGE_STEPS_POOL stays "TURN_LEFT,TURN_RIGHT",
-same rule already applied to BLINK — see app/config.py comment). BLINK IS
-NOT IN THE DEFAULT POOL. The EAR index mapping was verified against a
-real photo (see face_landmarks.py), but LIVENESS_EAR_BLINK_MAX — the
+AS OF 2026-07-21 (owner request: 4 challenge actions — left/right/up/down),
+NOD_UP/NOD_DOWN GRADUATED INTO THE DEFAULT POOL
+(app/config.py::LIVENESS_CHALLENGE_STEPS_POOL is now
+"TURN_LEFT,TURN_RIGHT,NOD_UP,NOD_DOWN") — see LIVENESS_PITCH_NOD_MIN_DEG's
+docstring in app/config.py for why: real s001 device-captured pitch
+evidence exists (intentional look-up/look-down tilts measured at
+pitch=+36.88/-34.08), the same class of evidence TURN_LEFT/TURN_RIGHT's own
+yaw threshold already relies on, and materially stronger than what BLINK or
+SMILE have. BLINK and SMILE remain in the "capability exists, not yet
+trusted" state below — implemented and reachable via SUPPORTED_STEPS,
+deliberately NOT in the default pool, because neither has any real
+same-domain capture (open+closed eye / neutral+smiling mouth) to calibrate
+against, only literature/single-baseline placeholders.
+
+BLINK IS NOT IN THE DEFAULT POOL. The EAR index mapping was verified against
+a real photo (see face_landmarks.py), but LIVENESS_EAR_BLINK_MAX — the
 open-vs-closed cutoff — is still an unverified literature placeholder with
 no real closed-eye calibration data; see app/config.py for the full caveat,
 including a same-domain sanity check that found one genuinely-open real eye
@@ -47,8 +56,15 @@ yaw/pitch sign (positive = ? / negative = ?) is used here with the
 assumption "positive yaw = subject turns their face toward the camera's
 right (viewer's right), i.e. their own left" and, symmetrically, "positive
 pitch = subject tilts their chin up" — these are common conventions for
-this pose model, but NEITHER has been confirmed against a real, labeled
-"person turns/nods on command" capture from an E-GAZ device. If either
+this pose model. NEITHER has been confirmed against a real, labeled "person
+turns/nods on command" capture from an E-GAZ device — a real capture DOES
+exist now (s001, app/pose_check.py) whose "left15/left30"/"up (tilt)"
+labels happen to align with both assumptions above, but that capture's own
+labeling protocol (camera-observed direction vs. subject-self-reported
+direction) is not preserved/reviewable in this repo, only the aggregate
+pitch/yaw numbers are — so this counts as mildly SUPPORTIVE, not
+CONFIRMING, evidence, and it applies EQUALLY to yaw and pitch (pitch is not
+worse-off than yaw here, despite being the newer addition). If either
 mapping is backwards, the corresponding pair (TURN_LEFT/TURN_RIGHT or
 NOD_UP/NOD_DOWN) swaps meaning but the SECURITY property (some real
 rotation happened, in some direction, at the requested moment) still holds

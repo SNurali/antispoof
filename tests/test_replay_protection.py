@@ -46,29 +46,41 @@ def _frame(seq: int) -> dict:
     return {"seq": seq, "base64": _make_base64_image(), "captured_at": None}
 
 
-def _yaw_for_step(step: str) -> float:
-    return 25.0 if step == "TURN_LEFT" else -25.0
+def _pose_for_step(step: str) -> tuple[float, float]:
+    """See tests/test_liveness_endpoints.py's identical helper — (yaw, pitch)
+    pair that satisfies `step`'s evidence check with generous margin above
+    every configured threshold (LIVENESS_YAW_TURN_MIN_DEG=20.0,
+    LIVENESS_PITCH_NOD_MIN_DEG=18.0 as of 2026-07-21)."""
+    return {
+        "TURN_LEFT": (25.0, 0.0),
+        "TURN_RIGHT": (-25.0, 0.0),
+        "NOD_UP": (0.0, 25.0),
+        "NOD_DOWN": (0.0, -25.0),
+    }[step]
 
 
-def _yaws_matching_step_order(steps: list[str]) -> list[float]:
+def _poses_matching_step_order(steps: list[str]) -> list[tuple[float, float]]:
     """See tests/test_liveness_endpoints.py's identical helper — order-by-
     evidence (Phase 3.1, CHALLENGE_ENTROPY_SPRINT_v1.md §6.1) means a
-    hardcoded TURN_LEFT-then-TURN_RIGHT yaw sequence is flaky now that step
-    order is genuinely randomized (secrets ГСЧ, Фаза 0/2) — build the
-    sequence from the ACTUAL challenge_spec.steps returned instead."""
-    assert len(steps) == 2, "helper assumes today's 2-step pool (TURN_LEFT,TURN_RIGHT)"
-    return [0.0, _yaw_for_step(steps[0]), 0.0, _yaw_for_step(steps[1])]
+    hardcoded TURN_LEFT-then-TURN_RIGHT sequence is flaky now that step
+    order/composition is genuinely randomized (secrets ГСЧ, 4-item pool
+    TURN_LEFT/TURN_RIGHT/NOD_UP/NOD_DOWN, 2026-07-21, k in {3,4}) — build the
+    pose sequence from the ACTUAL challenge_spec.steps returned instead. ONE
+    leading frontal pose + one evidence pose per step (1+k total, fits
+    [LIVENESS_MIN_FRAMES, LIVENESS_MAX_FRAMES]=[4,6] for k in {3,4})."""
+    return [(0.0, 0.0)] + [_pose_for_step(s) for s in steps]
 
 
-def _mock_frame_face(yaw: float = 0.0):
+def _mock_frame_face(yaw: float = 0.0, pitch: float = 0.0):
     """Bbox 100x100 in a 200x200 frame => face_area_ratio=0.25, below the
     default FACE_RATIO_REJECT=0.27 geometry-gate threshold (see
-    tests/test_liveness_endpoints.py for the same convention)."""
+    tests/test_liveness_endpoints.py for the same convention). `pitch`
+    added 2026-07-21 alongside NOD_UP/NOD_DOWN joining the default pool."""
     from app.face_landmarks import FrameFace
     return FrameFace(
         bbox_xyxy=(50.0, 50.0, 150.0, 150.0),
         kps=np.array([[70, 80], [130, 80], [100, 110], [80, 140], [120, 140]], dtype=np.float32),
-        pose_pitch=0.0, pose_yaw=yaw, pose_roll=0.0, det_score=0.9, n_faces_detected=1,
+        pose_pitch=pitch, pose_yaw=yaw, pose_roll=0.0, det_score=0.9, n_faces_detected=1,
     )
 
 
@@ -354,10 +366,12 @@ class TestReplayProtectionLivenessVerdict:
         Phase 3.1) so the request can reach `verdict=live`."""
         m.settings.REPLAY_PROTECTION_ENABLED = False
         ch = client.post("/liveness/challenge", json=_challenge_body()).json()
+        frame_count = m.settings.LIVENESS_MIN_FRAMES
         if satisfy_challenge:
-            yaws = _yaws_matching_step_order(ch["challenge_spec"]["steps"])
-            m.landmark_detector.analyze.side_effect = [_mock_frame_face(yaw=y) for y in yaws]
-        frames = [_frame(i) for i in range(m.settings.LIVENESS_MIN_FRAMES)]
+            poses = _poses_matching_step_order(ch["challenge_spec"]["steps"])
+            m.landmark_detector.analyze.side_effect = [_mock_frame_face(yaw=y, pitch=p) for y, p in poses]
+            frame_count = len(poses)
+        frames = [_frame(i) for i in range(frame_count)]
         return {
             "correlation_id": "replay-c1", "session_id": ch["session_id"],
             "transaction_type": "sale", "transaction_ref": "r:b", "frames": frames,

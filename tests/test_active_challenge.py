@@ -272,11 +272,12 @@ class TestVerifyChallengeBlink:
 
 
 class TestVerifyChallengeNod:
-    """NOD_UP/NOD_DOWN (CHALLENGE_ENTROPY_SPRINT_v1.md §4.1, Фаза 1) —
-    implemented but deliberately not in the default pool (see
-    app/config.py::LIVENESS_PITCH_NOD_MIN_DEG for the sign-convention
-    caveat). Symmetric to TURN_LEFT/TURN_RIGHT's yaw check, so these tests
-    mirror TestVerifyChallenge's TURN tests 1:1 with pitch instead of yaw."""
+    """NOD_UP/NOD_DOWN (CHALLENGE_ENTROPY_SPRINT_v1.md §4.1, Фаза 1;
+    PROMOTED INTO THE DEFAULT POOL 2026-07-21, see app/config.py::
+    LIVENESS_CHALLENGE_STEPS_POOL and LIVENESS_PITCH_NOD_MIN_DEG for the
+    calibration rationale and the sign-convention caveat). Symmetric to
+    TURN_LEFT/TURN_RIGHT's yaw check, so these tests mirror
+    TestVerifyChallenge's TURN tests 1:1 with pitch instead of yaw."""
 
     def test_nod_up_is_a_supported_step(self):
         frames = [(0, _face(0.0))]
@@ -346,6 +347,96 @@ class TestVerifyChallengeNod:
         ]
         result = verify_challenge(["TURN_LEFT", "NOD_UP"], frames, _settings())
         assert result.passed is True
+
+
+class TestNodDefaultPoolMembership:
+    """RZA, 2026-07-21 (owner request: 4 challenge actions —
+    left/right/up/down): NOD_UP/NOD_DOWN moved from "implemented but
+    excluded" to genuine default-pool members. This class proves that at
+    the REAL `Settings()` config layer (not a hand-built pool list), not
+    just at the `verify_challenge`/SUPPORTED_STEPS mechanism level already
+    covered above."""
+
+    def test_nod_steps_are_in_the_real_default_pool(self):
+        from app.config import Settings
+
+        pool = {s.strip() for s in Settings(SERVICE_TOKEN="").LIVENESS_CHALLENGE_STEPS_POOL.split(",")}
+        assert {"TURN_LEFT", "TURN_RIGHT", "NOD_UP", "NOD_DOWN"} == pool
+
+    def test_blink_and_smile_still_excluded_from_default_pool(self):
+        """Regression guard against accidentally widening the pool further
+        than the owner's 4-action request — BLINK/SMILE stay excluded
+        (uncalibrated, see app/config.py::LIVENESS_EAR_BLINK_MAX /
+        LIVENESS_MAR_SMILE_MIN)."""
+        from app.config import Settings
+
+        pool = {s.strip() for s in Settings(SERVICE_TOKEN="").LIVENESS_CHALLENGE_STEPS_POOL.split(",")}
+        assert "BLINK" not in pool
+        assert "SMILE" not in pool
+
+    def test_default_nod_min_deg_is_18(self):
+        """Locks in the recalibrated value (20.0 -> 18.0, see app/config.py::
+        LIVENESS_PITCH_NOD_MIN_DEG docstring for the s001-derived rationale)
+        as a regression guard against a silent drift."""
+        from app.config import Settings
+
+        assert Settings(SERVICE_TOKEN="").LIVENESS_PITCH_NOD_MIN_DEG == 18.0
+
+    def test_nod_evidence_at_default_threshold_boundary(self):
+        """Using the REAL default Settings() (18.0 pitch threshold, not a
+        hardcoded test constant) — a pitch of 19.0 (just above) must satisfy
+        NOD_UP; 17.0 (just below) must not, mirroring
+        TestCheckFacePose's boundary-exclusive convention in
+        tests/test_pose_check.py for the sibling Layer 0d gate."""
+        settings = Settings(SERVICE_TOKEN="")
+        frames_pass = [(0, _face(0.0, pitch=0.0)), (1, _face(0.0, pitch=19.0))]
+        result_pass = verify_challenge(["NOD_UP"], frames_pass, settings)
+        assert result_pass.passed is True
+
+        frames_fail = [(0, _face(0.0, pitch=0.0)), (1, _face(0.0, pitch=17.0))]
+        result_fail = verify_challenge(["NOD_UP"], frames_fail, settings)
+        assert result_fail.passed is False
+        assert result_fail.reason == "STEP_NOT_DETECTED"
+
+    def test_all_four_pool_steps_in_order_by_evidence(self):
+        """End-to-end order-by-evidence (Phase 3.1) across ALL FOUR default
+        pool steps in one challenge — TURN and NOD evidence interleaved,
+        proving the pitch axis and yaw axis do not cross-contaminate each
+        other's evidence search (a NOD_UP frame, yaw=0, must not accidentally
+        satisfy a TURN step search window, and vice versa) using the REAL
+        default Settings() thresholds."""
+        settings = Settings(SERVICE_TOKEN="")
+        frames = [
+            (0, _face(0.0, pitch=0.0)),     # frontal reference
+            (1, _face(25.0, pitch=0.0)),    # TURN_LEFT evidence
+            (2, _face(0.0, pitch=25.0)),    # NOD_UP evidence
+            (3, _face(-25.0, pitch=0.0)),   # TURN_RIGHT evidence
+            (4, _face(0.0, pitch=-25.0)),   # NOD_DOWN evidence
+        ]
+        steps = ["TURN_LEFT", "NOD_UP", "TURN_RIGHT", "NOD_DOWN"]
+        result = verify_challenge(steps, frames, settings)
+        assert result.passed is True
+        assert result.detail["step_evidence_seq"] == {
+            "TURN_LEFT": 1, "NOD_UP": 2, "TURN_RIGHT": 3, "NOD_DOWN": 4,
+        }
+
+    def test_all_four_pool_steps_wrong_order_fails(self):
+        """Same evidence frames as above, but requested in the WRONG order
+        (NOD_DOWN before TURN_RIGHT actually occurred) — must fail, not
+        silently reuse out-of-order evidence, same guard already proven for
+        the 2-step TURN-only case in TestVerifyChallengeOrderByEvidence."""
+        settings = Settings(SERVICE_TOKEN="")
+        frames = [
+            (0, _face(0.0, pitch=0.0)),
+            (1, _face(25.0, pitch=0.0)),    # TURN_LEFT evidence
+            (2, _face(0.0, pitch=25.0)),    # NOD_UP evidence
+            (3, _face(-25.0, pitch=0.0)),   # TURN_RIGHT evidence
+            (4, _face(0.0, pitch=-25.0)),   # NOD_DOWN evidence
+        ]
+        steps = ["TURN_LEFT", "NOD_DOWN", "NOD_UP", "TURN_RIGHT"]
+        result = verify_challenge(steps, frames, settings)
+        assert result.passed is False
+        assert result.reason == "STEP_NOT_DETECTED"
 
 
 class TestVerifyChallengeSmile:
