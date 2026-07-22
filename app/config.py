@@ -118,6 +118,36 @@ class Settings(BaseSettings):
     # disabled, without a code change.
     DOCUMENT_CHECK_TIMEOUT_S: float = 20.0
 
+    # Print-pattern override in app/liveness.py::_fuse (RZA, 2026-07-22
+    # incident — printed passport-page photo scored verdict=live,
+    # combined_score=0.5671; see app/multisignal.py's PRINT_PATTERN_FFT_MIN/
+    # PRINT_PATTERN_COLOR_MIN docstring for the full corpus numbers this was
+    # calibrated against). UNLIKE every other flag in this file, this does
+    # NOT gate a separate Layer 0 pre-filter module — it changes the
+    # always-on `_fuse()` ensemble logic threaded through LivenessEngine's
+    # constructor (app/main.py::_load_models). DEFAULT ENABLED: the negative-
+    # class margin is the strongest evidence in this repo's calibration
+    # history for a default-on flag — 0 hits across 79 phash-deduplicated
+    # bonafide/unverified samples: 12 confirmed bonafide + 42 unverified real
+    # (faces-dataset/real, Telegram-scrape provenance, not ground-truth
+    # confirmed — see app/resolution_check.py's own caveat on this folder)
+    # + 25 unverified fake (faces-dataset/fake, same caveat), the latter two
+    # used only as an extra FRR/FAR sanity check, not a calibration target —
+    # stronger than GEOMETRY_CHECK_ENABLED's own n=12 bonafide bar when it
+    # defaulted on. The positive-class evidence is thinner (n=1 confirmed
+    # sample of this specific full-page-document attack sub-class) — same
+    # "not a statistically tight bound" caveat every Layer 0/1 gate here
+    # already carries. Raw corpus retained on disk at
+    # /home/mrnurali/E-GAZ/faces-dataset/{real,fake}/ (not
+    # /home/mrnurali/faces-dataset — the path 2PAC checked during review and
+    # did not find; re-point any future audit at the E-GAZ/ path instead of
+    # re-collecting). Flip to False to revert this specific fusion-logic
+    # change without a code rollback if real traffic surfaces a false-accept
+    # case this repo's corpus could not see (e.g. a genuine grayscale/
+    # heavily-desaturated or very flat-lit live selfie that also clears the
+    # fft print-pattern bucket).
+    PRINT_PATTERN_OVERRIDE_ENABLED: bool = True
+
     # Layer 0a — deterministic face-to-frame geometry gate (RZA, 2026-07-16,
     # RE-CALIBRATED 2026-07-16 evening after a second real incident slipped
     # through the original 0.35 threshold — see app/geometry_check.py module

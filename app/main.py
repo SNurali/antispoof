@@ -51,7 +51,7 @@ from app.geometry_check import GeometryCheckResult, check_face_geometry
 from app.identity_consistency import compute_identity_consistency
 from app.pose_check import PoseCheckResult, check_face_pose
 from app.resolution_check import ResolutionCheckResult, check_image_resolution
-from app.liveness import LivenessEngine
+from app.liveness import LivenessEngine, pad_check_reason
 from app.liveness_session import (
     StepWindowDict,
     build_session_store,
@@ -191,7 +191,7 @@ document_checker: DocumentPhotoChecker = DocumentPhotoChecker(
     timeout_s=settings.DOCUMENT_CHECK_TIMEOUT_S,
 )
 
-MODEL_VERSION = "silentface-2.7_80x80_MiniFASNetV2+4_0_0_80x80_MiniFASNetV1SE+multisignal-v1"
+MODEL_VERSION = "silentface-2.7_80x80_MiniFASNetV2+4_0_0_80x80_MiniFASNetV1SE+multisignal-v1+print-pattern-v1"
 
 # Max image dimensions (memory DoS protection)
 MAX_IMAGE_DIMENSION = 4000
@@ -463,7 +463,10 @@ def _load_models() -> None:
         log.warning("Running on CPU — inference will be slower")
 
     detector = FaceDetector(settings.MODEL_DIR)
-    engine = LivenessEngine(settings.MODEL_DIR, DEVICE)
+    engine = LivenessEngine(
+        settings.MODEL_DIR, DEVICE,
+        print_pattern_override_enabled=settings.PRINT_PATTERN_OVERRIDE_ENABLED,
+    )
     _models_loaded = True
     log.info("Models loaded. Ready.")
 
@@ -1145,9 +1148,9 @@ class PadCheckResponse(BaseModel):
     reason: Optional[str] = Field(
         None,
         description=(
-            "PASSIVE_PAD_SPOOF | DOCUMENT_PHOTO | BLURRY | OFF_ANGLE | LOW_RESOLUTION | "
-            "NON_CAMERA_GEOMETRY | DUPLICATE_PHOTO | NO_FACE | LOW_QUALITY | TIMEOUT | "
-            "INTERNAL_ERROR | null"
+            "PASSIVE_PAD_SPOOF | PRINT_PATTERN_SPOOF | DOCUMENT_PHOTO | BLURRY | OFF_ANGLE | "
+            "LOW_RESOLUTION | NON_CAMERA_GEOMETRY | DUPLICATE_PHOTO | NO_FACE | LOW_QUALITY | "
+            "TIMEOUT | INTERNAL_ERROR | null"
         ),
     )
     score: float = Field(..., description="Confidence score [0..1]")
@@ -1581,10 +1584,14 @@ async def pad_check(
             save_frame=False, signals={}, model_version=MODEL_VERSION, processing_ms=ms,
         )
 
-    # Map to PAD-gate verdict (§1) — verdict/threshold logic unchanged, only naming aligned to spec
+    # Map to PAD-gate verdict (§1) — verdict/threshold logic unchanged, only naming aligned to spec.
+    # reason is PRINT_PATTERN_SPOOF vs PASSIVE_PAD_SPOOF depending on which
+    # override in _fuse() fired — see app/liveness.py::pad_check_reason
+    # docstring (2026-07-22, 2PAC review round 2: Умид needs to filter false
+    # rejects by signal, a single shared reason hid the new override).
     if label == "spoof":
         verdict = "spoof"
-        reason: Optional[str] = "PASSIVE_PAD_SPOOF"
+        reason: Optional[str] = pad_check_reason(label, signal_info)
     elif score < settings.LIVENESS_THRESHOLD:
         verdict = "low_quality"
         reason = "LOW_QUALITY"

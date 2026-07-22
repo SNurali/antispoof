@@ -325,6 +325,76 @@ def jpeg_artifact_score(face_bgr: np.ndarray) -> float:
 
 RECAPTURE_SPOOF_THRESHOLD = 0.5  # >= this => treat as physical recapture spoof
 
+# ---------------------------------------------------------------------------
+# Print-pattern override thresholds (RZA, 2026-07-22 incident — printed
+# passport-page photo scored nn_score=0.5671/combined_label=real on
+# /pad/check; see app/liveness.py::_fuse for the override this feeds and the
+# full root-cause writeup).
+#
+# WHY `recapture` MISSED THIS ATTACK: the passport photo was a SHARP,
+# high-resolution close-up shot of a physical paper document — it is NOT a
+# low-detail screen/print recapture (recapture's own design target). Measured
+# on the real incident file: recapture=0.003 (near-zero, i.e. "high detail,
+# real-like") because the paper's own print-halftone dots, MRZ text and
+# fibre texture ARE high-frequency detail — recapture cannot tell "detailed
+# because it's real skin" from "detailed because it's a sharp photo of a
+# highly-textured printed page". This is a genuine BLIND SPOT of that
+# signal for this specific attack sub-class, not a threshold-tuning bug.
+#
+# WHAT DID fire correctly on the same frame: `fft`=0.6 (the print's
+# halftone-dot grid is exactly the periodic high-frequency pattern this
+# signal targets) and `color`=0.6 (a sepia/monochrome document scan has
+# near-zero chrominance spread — cr_std<4 and cb_std<3, the tightest color()
+# bucket). Both are RIGHT, but each is individually under-weighted in the
+# combined ensemble (fft=0.05, color=0.10 of SIGNAL_WEIGHTS) so together they
+# only contributed spoof_probability=0.0914 to the weighted sum — just under
+# every soft threshold in `_fuse()` (nearest is `> 0.1`).
+#
+# CALIBRATION (RZA, 2026-07-22), same corpus discipline as RECAPTURE_SPOOF_
+# THRESHOLD above — full pipeline (real FaceDetector + LivenessEngine,
+# phash-deduplicated) run on:
+#   - BONAFIDE_urgut_orig (n=12, confirmed real):      0/12  hits
+#   - BONAFIDE_faces_real (n=42 after phash-dedup of
+#     faces-dataset/real, unverified Telegram-scrape
+#     provenance, used ONLY as an FRR check, not FAR):  0/42  hits
+#   - UNVERIFIED_faces_fake (n=25 after dedup of
+#     faces-dataset/fake, provenance/ground-truth
+#     unverified — see app/resolution_check.py's own
+#     caveat on this folder — informational only):      0/25  hits
+#   - SPOOF_urgut_recapture (n=11, confirmed spoof):    0/11  hits (already
+#     caught via the recapture override instead — no overlap needed)
+#   - SPOOF_passport_tightcrop (n=1, urgut_v2_passport/
+#     passport_style_spoof_01.jpg, confirmed spoof):     0/1   hit (already
+#     caught via the recapture override — fft=0.6 but color=0.0 there, a
+#     DIFFERENT sub-signature than this incident)
+#   - SPOOF_passport_fullpage (n=1, THIS incident,
+#     confirmed spoof):                                  1/1   hit
+#
+# `color >= 0.5` ALONE (without the `fft` co-condition) has ONE false
+# positive in the 42-file faces-dataset/real corpus (fft=0.3, color=0.6,
+# recapture=0.6735 — a plausible desaturated/grayscale-filtered photo in
+# that unverified scrape) — this is exactly why the rule below requires
+# BOTH `fft` AND `color` to independently clear their thresholds, not
+# `color` alone. With the AND-composite, the false positive above does not
+# fire (its fft=0.3 < PRINT_PATTERN_FFT_MIN) and the overall margin across
+# all 79 bonafide+unverified samples (12 confirmed bonafide + 42 unverified
+# real + 25 unverified fake — see the CALIBRATION list above; NOT 91, a prior
+# version of this docstring miscounted the sum) is clean (0 hits).
+#
+# HONESTY CAVEAT: this is n=1 for the specific attack sub-class it targets
+# (full-page passport photo) and n=2 counting the differently-signed
+# tightcrop spoof it does NOT rely on — a real but thin positive-class
+# sample, the same "not a statistically tight bound" caveat every other
+# Layer 0/1 gate in this service already carries (see geometry_check.py).
+# The negative-class margin (79 bonafide/unverified, 0 hits) is the
+# strongest part of this calibration and the primary reason this override
+# defaults ON in app/config.py::PRINT_PATTERN_OVERRIDE_ENABLED — see that
+# flag's docstring for the rollback path AND for the raw corpus's actual
+# on-disk location (/home/mrnurali/E-GAZ/faces-dataset/{real,fake}/ — it IS
+# retained, just not at the /home/mrnurali/faces-dataset path 2PAC checked).
+PRINT_PATTERN_FFT_MIN = 0.5
+PRINT_PATTERN_COLOR_MIN = 0.5
+
 
 def _ramp(x: float, lo: float, hi: float) -> float:
     """1.0 when x<=lo (spoof-like), 0.0 when x>=hi (real-like), linear between."""

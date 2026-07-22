@@ -11,7 +11,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from app.multisignal import analyze_face, SIGNAL_WEIGHTS, RECAPTURE_SPOOF_THRESHOLD
+from app.multisignal import (
+    analyze_face,
+    SIGNAL_WEIGHTS,
+    RECAPTURE_SPOOF_THRESHOLD,
+    PRINT_PATTERN_FFT_MIN,
+    PRINT_PATTERN_COLOR_MIN,
+)
 
 # HISTORICAL CONSTANT — no longer read anywhere in `_fuse` (MF DOOM review,
 # 2026-07-16: the `nn_very_confident_real` variable that used to gate on
@@ -50,7 +56,12 @@ NN_TRUST_SPOOF = 0.90
 SIGNAL_TRUST_REAL_MAX = 0.20
 
 
-def _fuse(nn_label: int, nn_score: float, signal_info: dict) -> tuple[str, float]:
+def _fuse(
+    nn_label: int,
+    nn_score: float,
+    signal_info: dict,
+    print_pattern_override_enabled: bool = True,
+) -> tuple[str, float]:
     """Combine NN output with multi-signal analysis into a final verdict.
 
     A high `recapture` score (confirmed by `lbp`/`moire`) is a physical,
@@ -104,6 +115,37 @@ def _fuse(nn_label: int, nn_score: float, signal_info: dict) -> tuple[str, float
     set, but the risk is real given only n=12 bonafide. Owner's directive
     (2026-07-16) is to bias toward this trade-off: reject a borderline live
     frame over letting a document spoof through.
+
+    2026-07-22 incident fix (print-pattern override added): a SHARP,
+    high-resolution photo of a full printed passport page (held at normal
+    selfie distance, not filling the frame — so the Layer 0a geometry gate's
+    face_area_ratio=0.0735 stayed far below its 0.27 threshold too) scored
+    nn_score=0.5671 (barely-confident "real", essentially a coin flip) with
+    recapture=0.003 — recapture reads this as "high detail, real-like"
+    because a sharp close-up of a printed page's own halftone/text/fibre
+    texture genuinely IS high-frequency detail; recapture cannot distinguish
+    "detailed because real skin" from "detailed because sharp photo of a
+    highly-textured printed surface". This is a blind spot of that signal
+    for THIS attack sub-class (full-page document photographed sharply),
+    distinct from the low-detail screen/print recapture class the existing
+    override above targets. `fft`=0.6 (print halftone-dot periodicity) and
+    `color`=0.6 (near-zero chrominance spread — a sepia/monochrome scan)
+    BOTH correctly fired on this frame, but at their production ensemble
+    weights (0.05 / 0.10 of SIGNAL_WEIGHTS) only contributed
+    spoof_probability=0.0914 — under every soft threshold below (nearest is
+    `> 0.1`). Adding a dedicated, symmetric override — like the recapture
+    override above, but for the "print pattern + desaturated tone" signature
+    instead of "low detail" — catches this without re-weighting the whole
+    ensemble (which would risk destabilizing every other already-calibrated
+    case). See app/multisignal.py's PRINT_PATTERN_FFT_MIN/
+    PRINT_PATTERN_COLOR_MIN docstring for the full corpus numbers (0 hits
+    across 79 bonafide/unverified samples — 12 confirmed bonafide + 42
+    unverified real + 25 unverified fake — 1/1 catch on this incident).
+    `print_pattern_override_enabled` defaults True but is threaded through
+    from app.config.Settings.PRINT_PATTERN_OVERRIDE_ENABLED via
+    LivenessEngine's constructor — flip that flag to False to revert this
+    specific change without a code rollback if it turns out to cost real FRR
+    in production traffic this repo's calibration corpus cannot see.
     """
     recap = signal_info["signal_scores"].get("recapture", 0.0)
     spoof_prob = signal_info["spoof_probability"]
@@ -112,7 +154,20 @@ def _fuse(nn_label: int, nn_score: float, signal_info: dict) -> tuple[str, float
     recapture_confirmed = lbp > 0.1 or moire > 0.1
 
     if recap >= RECAPTURE_SPOOF_THRESHOLD and recapture_confirmed:
+        # Tag the trigger so pad_check_reason() below can tell this apart
+        # from the print-pattern override — same "spoof" verdict, DIFFERENT
+        # reason string in the /pad/check response (2026-07-22, RZA, for
+        # 2PAC review round 2: Умид needs to filter false-reject rate by
+        # signal, and a single shared PASSIVE_PAD_SPOOF reason hid that).
+        signal_info["spoof_trigger"] = "recapture_override"
         return "spoof", max(recap, spoof_prob)
+
+    fft = signal_info["signal_scores"].get("fft", 0.0)
+    color = signal_info["signal_scores"].get("color", 0.0)
+    if print_pattern_override_enabled and fft >= PRINT_PATTERN_FFT_MIN and color >= PRINT_PATTERN_COLOR_MIN:
+        signal_info["spoof_trigger"] = "print_pattern_override"
+        return "spoof", max(fft, color, spoof_prob)
+
     if nn_label != 1:
         # 2026-07-06 incident fix #2: a real outdoor selfie (bright sun, bald
         # head, high-contrast wood-grain door background) made the CNN itself
@@ -137,6 +192,32 @@ def _fuse(nn_label: int, nn_score: float, signal_info: dict) -> tuple[str, float
     if spoof_prob > 0.1 and nn_score < 0.6:
         return "spoof", max(nn_score * 0.4, spoof_prob)
     return "real", nn_score
+
+
+def pad_check_reason(label: str, signal_info: dict) -> Optional[str]:
+    """Map an engine.predict()/predict_batch() verdict to the /pad/check
+    `reason` string (2026-07-22, RZA, 2PAC review round 2).
+
+    Every spoof path through `_fuse()` used to collapse to the same
+    reason="PASSIVE_PAD_SPOOF", indistinguishable from the recapture
+    override and from the plain soft-threshold ensemble spoof paths. That
+    hid the print-pattern override (see `_fuse` docstring) from Умид's
+    monitoring — he needs to filter the false-reject rate of THIS specific
+    signal separately, since it is new and calibrated on a thin (n=1)
+    positive-class sample (see PRINT_PATTERN_FFT_MIN/PRINT_PATTERN_COLOR_MIN
+    docstring in app/multisignal.py).
+
+    `_fuse()` tags `signal_info["spoof_trigger"]` in place when the
+    print-pattern or recapture override fires; every other spoof path
+    (NN-only, soft ensemble thresholds) leaves it unset and keeps the
+    original reason="PASSIVE_PAD_SPOOF".
+    """
+    if label != "spoof":
+        return None
+    if signal_info.get("spoof_trigger") == "print_pattern_override":
+        return "PRINT_PATTERN_SPOOF"
+    return "PASSIVE_PAD_SPOOF"
+
 
 # Add Silent-Face repo src to path for model definitions
 _REPO_SRC = Path(__file__).resolve().parent.parent / "src" / "model_lib"
@@ -217,9 +298,18 @@ def _crop_face(
 class LivenessEngine:
     """Loads both MiniFASNet models once, runs combined inference."""
 
-    def __init__(self, model_dir: Path, device: str) -> None:
+    def __init__(
+        self,
+        model_dir: Path,
+        device: str,
+        print_pattern_override_enabled: bool = True,
+    ) -> None:
         self._device = torch.device(device)
         self._models: list[tuple[torch.nn.Module, int, int, Optional[float]]] = []
+        # 2026-07-22 print-pattern override (see _fuse docstring) — threaded
+        # from app.config.Settings.PRINT_PATTERN_OVERRIDE_ENABLED so the fix
+        # can be reverted via an env-var flip, not a code rollback.
+        self._print_pattern_override_enabled = print_pattern_override_enabled
         self._load_models(model_dir)
 
     def _load_models(self, model_dir: Path) -> None:
@@ -278,7 +368,9 @@ class LivenessEngine:
         face_crop = _crop_face(image_bgr, bbox, self._models[0][3], 224, 224)
         signal_info = analyze_face(face_crop, face_px)
 
-        combined_label, combined_score = _fuse(nn_label, nn_score, signal_info)
+        combined_label, combined_score = _fuse(
+            nn_label, nn_score, signal_info, self._print_pattern_override_enabled
+        )
 
         signal_info["nn_label"] = "real" if nn_label == 1 else "spoof"
         signal_info["nn_score"] = round(nn_score, 4)
@@ -328,7 +420,9 @@ class LivenessEngine:
             # Signal analysis on the native crop (recapture needs full detail).
             signal_info = analyze_face(crops[i], face_px_list[i])
 
-            label, score = _fuse(nn_label, nn_score, signal_info)
+            label, score = _fuse(
+                nn_label, nn_score, signal_info, self._print_pattern_override_enabled
+            )
 
             signal_info["nn_label"] = "real" if nn_label == 1 else "spoof"
             signal_info["nn_score"] = round(nn_score, 4)
